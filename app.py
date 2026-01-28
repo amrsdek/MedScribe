@@ -13,8 +13,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
 from pdf2image import convert_from_bytes
-import concurrent.futures
-import random # عشان نعمل توقيتات عشوائية تمنع التصادم
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -27,7 +25,8 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🩺 Medical Study Assistant (Stable Mode 🛡️)")
+st.title("🩺 Medical Study Assistant")
+st.write("النسخة الأصلية المستقرة (تدعم PDF).")
 
 # --- دوال التنسيق ---
 def add_page_borders(doc):
@@ -62,15 +61,15 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة العامل الواحد (Robust Worker) ---
-def process_single_image_task(api_key, image_bytes, index, file_name):
+# --- دالة التحليل (بسيطة ومستقرة) ---
+def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
     model_name = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
     except:
-        return index, f"[Error processing image data for {file_name}]"
+        return "Error encoding image."
 
     headers = {'Content-Type': 'application/json'}
     
@@ -83,7 +82,7 @@ def process_single_image_task(api_key, image_bytes, index, file_name):
     """
     
     payload = {
-        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}]}],
+        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_image}}]}],
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -92,35 +91,23 @@ def process_single_image_task(api_key, image_bytes, index, file_name):
         ]
     }
     
-    # زيادة عدد المحاولات لـ 6 عشان منستسلمش بسهولة
-    max_retries = 6
-    for attempt in range(max_retries):
+    # محاولة بسيطة (3 مرات) مع انتظار
+    for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
-            
             if response.status_code == 200:
-                return index, response.json()['candidates'][0]['content']['parts'][0]['text']
-            
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
             elif response.status_code == 429:
-                # لو السيرفر مشغول، ننام وقت أطول كل مرة (Exponential Backoff)
-                # معادلة: (رقم المحاولة * 3) + وقت عشوائي عشان العمال ميخبطوش في بعض
-                sleep_time = (attempt + 1) * 3 + random.uniform(0, 2)
-                time.sleep(sleep_time)
+                time.sleep(5) # انتظار 5 ثواني لو السيرفر مشغول
                 continue
-            
-            elif response.status_code == 503:
+            else:
                 time.sleep(2)
                 continue
-                
-            else:
-                return index, f"[API Error {response.status_code}: Please check output manually]"
-                
-        except Exception as e:
+        except:
             time.sleep(2)
             continue
 
-    # لو فشل بعد 6 محاولات (وده صعب جداً يحصل دلوقتي)
-    return index, f"[Failed to convert page: {file_name}. Server was too busy.]"
+    return "Server Error (Please try again later)"
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -154,7 +141,7 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    with st.status("Initializing Stable Workers...", expanded=True) as status:
+    with st.status("Processing...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
         add_page_borders(doc)
@@ -162,72 +149,57 @@ if uploaded_files and st.button("Start Processing 🚀"):
         title = doc.add_paragraph(doc_name_input, style='Title')
         title.alignment = 1 
         
-        # 1. تجهيز المهام
-        tasks_data = [] 
-        st.write("📂 Preparing files...")
-        
-        global_index = 0
-        for file in uploaded_files:
-            if file.type == "application/pdf":
-                try:
-                    pdf_images = convert_from_bytes(file.read())
-                    for img in pdf_images:
-                        img_byte_arr = io.BytesIO()
-                        img.save(img_byte_arr, format='JPEG')
-                        tasks_data.append({
-                            "index": global_index,
-                            "bytes": img_byte_arr.getvalue(),
-                            "name": f"{file.name} (Page {global_index+1})"
-                        })
-                        global_index += 1
-                except Exception as e:
-                    st.error(f"Error PDF: {e}")
-            else:
-                 tasks_data.append({
-                     "index": global_index,
-                     "bytes": file.getvalue(),
-                     "name": file.name
-                 })
-                 global_index += 1
-
-        total_tasks = len(tasks_data)
-        
-        # 2. التشغيل المتوازي (Workers = 2)
-        # 2 هو الرقم الذهبي: أسرع من 1 بمرتين، وأكثر استقراراً من 4 بكتير
-        st.write(f"⚡ Processing {total_tasks} pages with 2 stable workers...")
-        
-        results = [None] * total_tasks
-        completed_count = 0
+        full_text_preview = ""
         progress_bar = st.progress(0)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_to_index = {
-                executor.submit(process_single_image_task, api_key, task["bytes"], task["index"], task["name"]): task["index"]
-                for task in tasks_data
-            }
+        # حساب إجمالي عدد الخطوات لضبط شريط التقدم
+        # (تقريبي لأننا لسه مش عارفين عدد صفحات الـ PDF بالظبط)
+        
+        # حلقة المعالجة الرئيسية (Sequential Loop)
+        for i, file in enumerate(uploaded_files):
+            st.write(f"📂 Reading file: {file.name}...")
             
-            for future in concurrent.futures.as_completed(future_to_index):
-                idx, text = future.result()
-                results[idx] = text
+            # 1. لو PDF
+            if file.type == "application/pdf":
+                try:
+                    images = convert_from_bytes(file.read())
+                    for page_idx, img in enumerate(images):
+                        st.write(f"📄 Analyzing {file.name} - Page {page_idx+1}...")
+                        
+                        img_byte_arr = io.BytesIO()
+                        img.save(img_byte_arr, format='JPEG')
+                        
+                        text = call_gemini_stable(api_key, img_byte_arr.getvalue())
+                        
+                        if not hide_img_name:
+                            doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
+                        
+                        # إضافة النص للوورد
+                        for line in text.split('\n'):
+                            line = line.strip()
+                            if not line: continue
+                            if line.startswith('#'):
+                                doc.add_heading(line.replace('#', '').strip(), level=1)
+                            else:
+                                doc.add_paragraph(line)
+                        
+                        doc.add_page_break()
+                        full_text_preview += f"\n{text}\n"
+                        
+                        # استراحة 2 ثانية بين الصفحات (سر الاستقرار)
+                        time.sleep(2)
+                        
+                except Exception as e:
+                    st.error(f"Error reading PDF: {e}")
+            
+            # 2. لو صورة عادية
+            else:
+                st.write(f"🖼️ Analyzing Image: {file.name}...")
+                text = call_gemini_stable(api_key, file.getvalue(), file.type)
                 
-                completed_count += 1
-                progress_bar.progress(completed_count / total_tasks)
+                if not hide_img_name:
+                    doc.add_heading(file.name, level=1)
                 
-                # لو النص رجع فيه Error، نظهر تحذير
-                if "[Failed" in text or "[Error" in text:
-                    st.warning(f"⚠️ Warning on page {idx+1}: {text}")
-                elif completed_count % 5 == 0:
-                     st.write(f"✅ Completed {completed_count}/{total_tasks}...")
-
-        # 3. الكتابة
-        st.write("📝 Finalizing document...")
-        for i, text in enumerate(results):
-            task_info = tasks_data[i]
-            
-            if not hide_img_name:
-                doc.add_heading(task_info["name"], level=1)
-            
-            if text:
                 for line in text.split('\n'):
                     line = line.strip()
                     if not line: continue
@@ -235,10 +207,15 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         doc.add_heading(line.replace('#', '').strip(), level=1)
                     else:
                         doc.add_paragraph(line)
+                
                 doc.add_page_break()
+                full_text_preview += f"\n{text}\n"
+                time.sleep(2)
 
+            progress_bar.progress((i + 1) / len(uploaded_files))
+        
         status.update(label="All Done!", state="complete", expanded=False)
-        st.success(f"تم الانتهاء! تمت معالجة {total_tasks} صفحة.")
+        st.success("تم الانتهاء بنجاح!")
         
         bio = io.BytesIO()
         doc.save(bio)
