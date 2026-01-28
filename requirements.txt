@@ -1,0 +1,6 @@
+streamlit
+google-generativeai
+python-docx
+Pillow
+streamlit-gsheets
+pandas
