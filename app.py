@@ -12,7 +12,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_bytes # المكتبة الجديدة
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -26,45 +26,9 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة المستقرة (Gemini 1.5 Flash Only).")
+st.write("حول صور المحاضرات أو ملفات PDF (Scanned) إلى ملف Word منسق.")
 
-# --- 1. دالة البحث عن الموديل المستقر فقط ---
-def get_stable_model_name(api_key):
-    """
-    تبحث فقط عن موديلات 1.5 المستقرة وتتجاهل النسخ التجريبية (2.5)
-    """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            models = data.get('models', [])
-            
-            # ترتيب الأولويات للموديلات المستقرة فقط
-            preferred_order = [
-                'gemini-1.5-flash-latest',
-                'gemini-1.5-flash-001',
-                'gemini-1.5-flash',
-                'gemini-1.5-pro-latest',
-                'gemini-1.5-pro'
-            ]
-            
-            # البحث عن الاسم الدقيق في القائمة
-            for pref in preferred_order:
-                for m in models:
-                    if pref in m['name']:
-                        return m['name'].replace('models/', '')
-            
-            # لو ملقاش، هات أي حاجة فيها flash وخلاص (بس ابعد عن 2.5)
-            for m in models:
-                if 'flash' in m['name'] and '1.5' in m['name']:
-                    return m['name'].replace('models/', '')
-                    
-        return "gemini-1.5-flash" # Default
-    except:
-        return "gemini-1.5-flash"
-
-# --- 2. دوال التنسيق ---
+# --- دوال التنسيق والإطار ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -97,54 +61,51 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- 3. دالة التحليل ---
-def call_gemini_stable_version(api_key, model_name, image_bytes, mime_type="image/jpeg"):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+# --- دالة التحليل ---
+def call_gemini_medical_with_retry(api_key, image_bytes, mime_type="image/jpeg"):
+    model_name = "gemini-2.5-flash"
     
-    try:
-        b64_image = base64.b64encode(image_bytes).decode('utf-8')
-    except:
-        return "Error encoding image."
-
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    b64_image = base64.b64encode(image_bytes).decode('utf-8')
     headers = {'Content-Type': 'application/json'}
     
     medical_prompt = """
     You are an expert Medical Scribe. Analyze this medical image.
     1. Extract all text accurately.
-    2. **Headings:** If you see a clear TITLE or HEADING, start the line with # (e.g., # Anatomy).
+    2. **Headings:** If you see a clear TITLE or HEADING in the image, start that line with a hash symbol (#). Example: "# Anatomy of Heart".
     3. **Body Text:** Write normal text as is.
     4. Do NOT use any other markdown.
     """
     
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+    ]
+    
     payload = {
         "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_image}}]}],
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
+        "safetySettings": safety_settings
     }
     
-    # 3 محاولات
-    for attempt in range(3):
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            elif response.status_code == 429: # Server Busy
-                time.sleep(5)
-                continue
-            else:
+            elif response.status_code == 503:
                 time.sleep(2)
                 continue
+            else:
+                return f"Error {response.status_code}"
         except:
-            time.sleep(2)
+            time.sleep(1)
             continue
+    return "Server Error"
 
-    return f"Error: Failed to process using {model_name}. Status: {response.status_code if 'response' in locals() else 'Unknown'}"
-
-# --- 4. دالة الفيدباك ---
+# --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -173,16 +134,10 @@ with col2:
     st.write("") 
     hide_img_name = st.checkbox("إخفاء اسم الصورة؟", value=False)
 
+# السماح برفع PDF وصور
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    
-    # تحديد الموديل المستقر
-    with st.spinner("Selecting best stable model..."):
-        active_model = get_stable_model_name(api_key)
-    
-    st.toast(f"Using Stable Model: {active_model}", icon="🛡️")
-    
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
@@ -194,67 +149,74 @@ if uploaded_files and st.button("Start Processing 🚀"):
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        for i, file in enumerate(uploaded_files):
-            st.write(f"📂 Reading: {file.name}")
+        # حساب إجمالي عدد الملفات لضبط شريط التقدم
+        total_files_count = len(uploaded_files)
+        current_file_index = 0
+
+        for file in uploaded_files:
+            current_file_index += 1
             
+            # 1. لو الملف PDF: فكه لصور
             if file.type == "application/pdf":
+                st.write(f"📄 Extracting pages from PDF: {file.name}...")
                 try:
+                    # تحويل صفحات الـ PDF لصور
                     images = convert_from_bytes(file.read())
-                    for page_idx, img in enumerate(images):
-                        st.write(f"📄 Analyzing Page {page_idx+1}...")
+                    
+                    for page_num, img in enumerate(images):
+                        st.write(f"Analyzing Page {page_num + 1} of {file.name}...")
                         
+                        # تحويل الصورة لـ Bytes عشان نبعتها لـ API
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
+                        img_bytes = img_byte_arr.getvalue()
                         
-                        text = call_gemini_stable_version(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
+                        text = call_gemini_medical_with_retry(api_key, img_bytes, "image/jpeg")
                         
                         if not hide_img_name:
-                            doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
+                            doc.add_heading(f'{file.name} - Page {page_num+1}', level=1)
                         
-                        if "Error:" in text:
-                             st.error(f"Failed page {page_idx+1}: {text}")
-                        else:
-                            for line in text.split('\n'):
-                                line = line.strip()
-                                if not line: continue
-                                if line.startswith('#'):
-                                    doc.add_heading(line.replace('#', '').strip(), level=1)
-                                else:
-                                    doc.add_paragraph(line)
+                        for line in text.split('\n'):
+                            line = line.strip()
+                            if not line: continue
+                            if line.startswith('#'):
+                                clean_line = line.replace('#', '').strip()
+                                doc.add_heading(clean_line, level=1)
+                            else:
+                                doc.add_paragraph(line)
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        time.sleep(2)
-                        
+                        time.sleep(1) # راحة للسيرفر بين الصفحات
+
                 except Exception as e:
-                    st.error(f"Error reading PDF: {e}")
+                    st.error(f"Error reading PDF {file.name}: {e}")
             
+            # 2. لو الملف صورة عادية
             else:
-                st.write(f"🖼️ Analyzing Image...")
-                text = call_gemini_stable_version(api_key, active_model, file.getvalue(), file.type)
+                st.write(f"🖼️ Analyzing Image: {file.name}...")
+                text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
                 
                 if not hide_img_name:
-                    doc.add_heading(file.name, level=1)
+                    doc.add_heading(f'Image: {file.name}', level=1)
                 
-                if "Error:" in text:
-                     st.error(f"Failed image: {text}")
-                else:
-                    for line in text.split('\n'):
-                        line = line.strip()
-                        if not line: continue
-                        if line.startswith('#'):
-                            doc.add_heading(line.replace('#', '').strip(), level=1)
-                        else:
-                            doc.add_paragraph(line)
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith('#'):
+                        clean_line = line.replace('#', '').strip()
+                        doc.add_heading(clean_line, level=1)
+                    else:
+                        doc.add_paragraph(line)
                 
                 doc.add_page_break()
                 full_text_preview += f"\n{text}\n"
-                time.sleep(2)
+                time.sleep(1)
 
-            progress_bar.progress((i + 1) / len(uploaded_files))
+            progress_bar.progress(current_file_index / total_files_count)
         
-        status.update(label="Done!", state="complete", expanded=False)
-        st.success("تم الانتهاء بنجاح!")
+        status.update(label="All Done!", state="complete", expanded=False)
+        st.success("تم الانتهاء!")
         
         bio = io.BytesIO()
         doc.save(bio)
