@@ -26,9 +26,37 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة المستقرة (Gemini 1.5 Flash).")
+st.write("النسخة الأصلية المستقرة (Auto-Detect Model).")
 
-# --- دوال التنسيق ---
+# --- 1. دالة اكتشاف الموديل (الحل الجذري للـ 404) ---
+def get_best_model(api_key):
+    """
+    تتصل بجوجل وتجيب اسم الموديل الصحيح المتاح حالياً للمفتاح ده.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get('models', [])
+            
+            # ترتيب الأولويات: ندور على 1.5 Flash الأول، لو مش موجود نشوف Pro
+            priorities = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']
+            
+            for priority in priorities:
+                for m in models:
+                    if priority in m['name'] and 'vision' not in m['name']:
+                        return m['name'].replace('models/', '')
+            
+            # لو ملقيناش ولا واحد من اللي فوق، هات أي موديل وخلاص
+            if models:
+                return models[0]['name'].replace('models/', '')
+                
+        return "gemini-1.5-flash" # اسم افتراضي لو البحث فشل
+    except:
+        return "gemini-1.5-flash"
+
+# --- 2. دوال التنسيق ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -61,16 +89,14 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة التحليل (المعدلة لكشف الأخطاء) ---
-def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
-    # رجعنا للموديل المستقر جداً والمضمون
-    model_name = "gemini-1.5-flash" 
+# --- 3. دالة التحليل (تستخدم الاسم المكتشف) ---
+def call_gemini_auto(api_key, model_name, image_bytes, mime_type="image/jpeg"):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
-    except Exception as e:
-        return f"Error encoding image: {str(e)}"
+    except:
+        return "Error encoding image."
 
     headers = {'Content-Type': 'application/json'}
     
@@ -92,34 +118,27 @@ def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
         ]
     }
     
-    last_error = ""
-    # 3 محاولات
     for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
-            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
-            elif response.status_code == 429:
-                last_error = "Server Busy (429)"
-                time.sleep(5) # استراحة 5 ثواني
+            elif response.status_code == 429: # لو السيرفر مشغول
+                time.sleep(5)
                 continue
-            
+            elif response.status_code == 404: # لو الموديل ده مش موجود، جرب الفلاش العادي
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+                continue
             else:
-                # تسجيل الخطأ الحقيقي
-                last_error = f"Error {response.status_code}: {response.text}"
                 time.sleep(2)
                 continue
-                
-        except Exception as e:
-            last_error = f"Connection Exception: {str(e)}"
+        except:
             time.sleep(2)
             continue
 
-    return f"Failed: {last_error}"
+    return f"Error: Could not process image using model {model_name}"
 
-# --- دالة الفيدباك ---
+# --- 4. دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -151,6 +170,12 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
+    # خطوة ذكية: نجيب اسم الموديل الشغال قبل ما نبدأ
+    with st.spinner("Connecting to Google Brain..."):
+        active_model = get_best_model(api_key)
+    
+    st.success(f"Connected using: {active_model} ✅")
+    
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
@@ -163,21 +188,19 @@ if uploaded_files and st.button("Start Processing 🚀"):
         progress_bar = st.progress(0)
         
         for i, file in enumerate(uploaded_files):
-            st.write(f"📂 Reading file: {file.name}...")
+            st.write(f"📂 Reading: {file.name}")
             
             if file.type == "application/pdf":
                 try:
                     images = convert_from_bytes(file.read())
                     for page_idx, img in enumerate(images):
-                        st.write(f"📄 Analyzing {file.name} - Page {page_idx+1}...")
+                        st.write(f"📄 Analyzing Page {page_idx+1}...")
                         
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         
-                        text = call_gemini_stable(api_key, img_byte_arr.getvalue(), "image/jpeg")
-                        
-                        if "Failed:" in text:
-                            st.error(f"⚠️ Error in Page {page_idx+1}: {text}")
+                        # نستخدم الموديل اللي اكتشفناه فوق
+                        text = call_gemini_auto(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
                         
                         if not hide_img_name:
                             doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
@@ -192,17 +215,14 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        time.sleep(2)
+                        time.sleep(2) # استراحة للأمان
                         
                 except Exception as e:
                     st.error(f"Error reading PDF: {e}")
             
             else:
-                st.write(f"🖼️ Analyzing Image: {file.name}...")
-                text = call_gemini_stable(api_key, file.getvalue(), file.type)
-                
-                if "Failed:" in text:
-                     st.error(f"⚠️ Error in Image: {text}")
+                st.write(f"🖼️ Analyzing Image...")
+                text = call_gemini_auto(api_key, active_model, file.getvalue(), file.type)
                 
                 if not hide_img_name:
                     doc.add_heading(file.name, level=1)
@@ -221,7 +241,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
 
             progress_bar.progress((i + 1) / len(uploaded_files))
         
-        status.update(label="All Done!", state="complete", expanded=False)
+        status.update(label="Done!", state="complete", expanded=False)
         st.success("تم الانتهاء!")
         
         bio = io.BytesIO()
