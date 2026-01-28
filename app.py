@@ -26,7 +26,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة الأصلية المستقرة (تدعم PDF).")
+st.write("النسخة المستقرة (Gemini 1.5 Flash).")
 
 # --- دوال التنسيق ---
 def add_page_borders(doc):
@@ -61,15 +61,16 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة التحليل (بسيطة ومستقرة) ---
+# --- دالة التحليل (المعدلة لكشف الأخطاء) ---
 def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
-    model_name = "gemini-2.5-flash"
+    # رجعنا للموديل المستقر جداً والمضمون
+    model_name = "gemini-1.5-flash" 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
-    except:
-        return "Error encoding image."
+    except Exception as e:
+        return f"Error encoding image: {str(e)}"
 
     headers = {'Content-Type': 'application/json'}
     
@@ -91,23 +92,32 @@ def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
         ]
     }
     
-    # محاولة بسيطة (3 مرات) مع انتظار
+    last_error = ""
+    # 3 محاولات
     for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
+            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
+            
             elif response.status_code == 429:
-                time.sleep(5) # انتظار 5 ثواني لو السيرفر مشغول
+                last_error = "Server Busy (429)"
+                time.sleep(5) # استراحة 5 ثواني
                 continue
+            
             else:
+                # تسجيل الخطأ الحقيقي
+                last_error = f"Error {response.status_code}: {response.text}"
                 time.sleep(2)
                 continue
-        except:
+                
+        except Exception as e:
+            last_error = f"Connection Exception: {str(e)}"
             time.sleep(2)
             continue
 
-    return "Server Error (Please try again later)"
+    return f"Failed: {last_error}"
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -152,14 +162,9 @@ if uploaded_files and st.button("Start Processing 🚀"):
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        # حساب إجمالي عدد الخطوات لضبط شريط التقدم
-        # (تقريبي لأننا لسه مش عارفين عدد صفحات الـ PDF بالظبط)
-        
-        # حلقة المعالجة الرئيسية (Sequential Loop)
         for i, file in enumerate(uploaded_files):
             st.write(f"📂 Reading file: {file.name}...")
             
-            # 1. لو PDF
             if file.type == "application/pdf":
                 try:
                     images = convert_from_bytes(file.read())
@@ -169,12 +174,14 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         
-                        text = call_gemini_stable(api_key, img_byte_arr.getvalue())
+                        text = call_gemini_stable(api_key, img_byte_arr.getvalue(), "image/jpeg")
+                        
+                        if "Failed:" in text:
+                            st.error(f"⚠️ Error in Page {page_idx+1}: {text}")
                         
                         if not hide_img_name:
                             doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
                         
-                        # إضافة النص للوورد
                         for line in text.split('\n'):
                             line = line.strip()
                             if not line: continue
@@ -185,17 +192,17 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        
-                        # استراحة 2 ثانية بين الصفحات (سر الاستقرار)
                         time.sleep(2)
                         
                 except Exception as e:
                     st.error(f"Error reading PDF: {e}")
             
-            # 2. لو صورة عادية
             else:
                 st.write(f"🖼️ Analyzing Image: {file.name}...")
                 text = call_gemini_stable(api_key, file.getvalue(), file.type)
+                
+                if "Failed:" in text:
+                     st.error(f"⚠️ Error in Image: {text}")
                 
                 if not hide_img_name:
                     doc.add_heading(file.name, level=1)
@@ -215,7 +222,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
             progress_bar.progress((i + 1) / len(uploaded_files))
         
         status.update(label="All Done!", state="complete", expanded=False)
-        st.success("تم الانتهاء بنجاح!")
+        st.success("تم الانتهاء!")
         
         bio = io.BytesIO()
         doc.save(bio)
