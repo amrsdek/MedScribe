@@ -43,8 +43,8 @@ def process_image_with_gemini(image, api_key):
     try:
         genai.configure(api_key=api_key)
         # تعديل هام: استخدام اسم الموديل الأكثر استقراراً
-        # لو gemini-1.5-flash-001 عمل مشكلة، جرب gemini-pro
-        model = genai.GenerativeModel('gemini-1.5-flash-001') 
+        # تجربة الموديل الأقوى والأكثر استقراراً
+        model = genai.GenerativeModel('gemini-1.5-pro')
         
         prompt = """
         ACT AS A MEDICAL SCRIBE. Analyze this medical document image.
@@ -125,3 +125,4 @@ with st.form("feedback"):
         except Exception as e:
             st.warning("حدث خطأ بسيط في الاتصال، لكن نيتك وصلت!")
             print(e)
+
