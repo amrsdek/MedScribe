@@ -26,9 +26,36 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة الصبورة (تعالج خطأ 429 تلقائياً).")
+st.write("النسخة الشاملة (Auto-Detect + Anti-429).")
 
-# --- 1. دالة التنسيق ---
+# --- 1. دالة اكتشاف الموديل (لحل مشكلة 404) ---
+def get_valid_model_name(api_key):
+    """
+    تتصل بجوجل وتجيب الاسم الرسمي للموديل الشغال (Flash 1.5)
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get('models', [])
+            
+            # ترتيب الأولويات: فلاش 1.5 المستقر
+            for m in models:
+                name = m['name']
+                if 'flash' in name and '1.5' in name and 'exp' not in name: # نتجنب النسخ التجريبية
+                    return name.replace('models/', '')
+            
+            # لو ملقاش، هات أي فلاش وخلاص
+            for m in models:
+                if 'flash' in m['name']:
+                    return m['name'].replace('models/', '')
+
+        return "gemini-1.5-flash" # احتياطي
+    except:
+        return "gemini-1.5-flash"
+
+# --- 2. دوال التنسيق ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -61,10 +88,9 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- 2. دالة الاتصال (مع فرامل للطوارئ) ---
-def call_gemini_retry(api_key, image_bytes, mime_type="image/jpeg"):
-    # نستخدم 1.5-flash لأنه الأوفر والأسرع
-    model_name = "gemini-1.5-flash"
+# --- 3. دالة التحليل (مع معالجة 429) ---
+def call_gemini_robust(api_key, model_name, image_bytes, mime_type="image/jpeg"):
+    # نستخدم الاسم اللي اكتشفناه
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
@@ -92,31 +118,34 @@ def call_gemini_retry(api_key, image_bytes, mime_type="image/jpeg"):
         ]
     }
     
-    # هنا السر: نحاول 5 مرات لو فشل
+    # محاولة 5 مرات لحل مشكلة 429
     for attempt in range(5):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
-            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
-            elif response.status_code == 429: # لو قالك استنى (Too Many Requests)
-                wait_time = (attempt + 1) * 5 # استنى 5 ثواني، ثم 10، ثم 15...
+            elif response.status_code == 429: # لو زحمة
+                wait_time = (attempt + 1) * 5
                 st.toast(f"⚠️ زحمة (429).. جاري الانتظار {wait_time} ثواني...", icon="⏳")
                 time.sleep(wait_time)
-                continue # عيد تاني
-                
-            else: # أي خطأ تاني
+                continue
+            elif response.status_code == 404: # لو الاسم غلط رغم البحث، جرب الفلاش العادي
+                 # محاولة أخيرة بتبديل الرابط لنسخة احتياطية
+                 if attempt == 0:
+                     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+                     continue
+                 else:
+                     return f"Error 404: Model not found."
+            else:
                 time.sleep(2)
                 continue
-                
-        except Exception as e:
+        except:
             time.sleep(2)
             continue
 
-    return f"Error: Failed after retries (Status: {response.status_code if 'response' in locals() else 'Unknown'})"
+    return f"Failed after retries (Status: {response.status_code if 'response' in locals() else 'Unknown'})"
 
-# --- 3. دالة الفيدباك ---
+# --- 4. دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -148,6 +177,13 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
+    
+    # 1. تحديد الموديل أولاً
+    with st.spinner("Connecting to Google Brain..."):
+        active_model = get_valid_model_name(api_key)
+    
+    st.toast(f"Connected: {active_model}", icon="✅")
+    
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
@@ -158,9 +194,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
         
         full_text_preview = ""
         progress_bar = st.progress(0)
-        
-        # متغير عشان نحسب النسبة المئوية
-        total_steps = len(uploaded_files) 
+        total_steps = len(uploaded_files)
         
         for i, file in enumerate(uploaded_files):
             st.write(f"📂 Reading: {file.name}")
@@ -168,20 +202,20 @@ if uploaded_files and st.button("Start Processing 🚀"):
             if file.type == "application/pdf":
                 try:
                     images = convert_from_bytes(file.read())
-                    # لو PDF بنزود وقت الراحة شوية
                     for page_idx, img in enumerate(images):
                         st.write(f"📄 Analyzing Page {page_idx+1}...")
                         
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         
-                        text = call_gemini_retry(api_key, img_byte_arr.getvalue(), "image/jpeg")
+                        # نبعت الموديل المكتشف + نعالج 429
+                        text = call_gemini_robust(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
                         
                         if not hide_img_name:
                             doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
                         
-                        if "Error:" in text:
-                             st.error(f"Failed page {page_idx+1}: {text}")
+                        if "Failed" in text or "Error" in text:
+                             st.error(f"Page {page_idx+1}: {text}")
                         else:
                             for line in text.split('\n'):
                                 line = line.strip()
@@ -193,22 +227,20 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        
-                        # --- أهم سطر: راحة 4 ثواني إجبارية بين كل صفحة ---
-                        time.sleep(4) 
+                        time.sleep(3) # راحة إجبارية
                         
                 except Exception as e:
                     st.error(f"Error reading PDF: {e}")
             
             else:
                 st.write(f"🖼️ Analyzing Image...")
-                text = call_gemini_retry(api_key, file.getvalue(), file.type)
+                text = call_gemini_robust(api_key, active_model, file.getvalue(), file.type)
                 
                 if not hide_img_name:
                     doc.add_heading(file.name, level=1)
                 
-                if "Error:" in text:
-                     st.error(f"Failed image: {text}")
+                if "Failed" in text or "Error" in text:
+                     st.error(f"Image Error: {text}")
                 else:
                     for line in text.split('\n'):
                         line = line.strip()
@@ -220,8 +252,6 @@ if uploaded_files and st.button("Start Processing 🚀"):
                 
                 doc.add_page_break()
                 full_text_preview += f"\n{text}\n"
-                
-                # --- أهم سطر: راحة 3 ثواني بين الصور ---
                 time.sleep(3)
 
             progress_bar.progress((i + 1) / total_steps)
