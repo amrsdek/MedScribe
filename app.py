@@ -26,13 +26,12 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة الذكية (Auto-Detect + PDF Support).")
+st.write("النسخة المستقرة (Gemini 1.5 Flash Only).")
 
-# --- 1. دالة اكتشاف الموديل (الحل الجذري للـ 404) ---
-def get_auto_model_name(api_key):
+# --- 1. دالة البحث عن الموديل المستقر فقط ---
+def get_stable_model_name(api_key):
     """
-    تتصل بجوجل وتجلب الاسم الرسمي للموديل المتاح حالياً
-    لتجنب خطأ 404 نهائياً.
+    تبحث فقط عن موديلات 1.5 المستقرة وتتجاهل النسخ التجريبية (2.5)
     """
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
@@ -41,32 +40,31 @@ def get_auto_model_name(api_key):
             data = response.json()
             models = data.get('models', [])
             
-            # 1. نبحث عن أي موديل Flash (الأسرع والأرخص)
-            for m in models:
-                name = m['name']
-                methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods and 'flash' in name:
-                    return name.replace('models/', '') # نرجع الاسم الصح
+            # ترتيب الأولويات للموديلات المستقرة فقط
+            preferred_order = [
+                'gemini-1.5-flash-latest',
+                'gemini-1.5-flash-001',
+                'gemini-1.5-flash',
+                'gemini-1.5-pro-latest',
+                'gemini-1.5-pro'
+            ]
             
-            # 2. لو مفيش، نبحث عن Pro
-            for m in models:
-                name = m['name']
-                methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods and 'pro' in name:
-                    return name.replace('models/', '')
+            # البحث عن الاسم الدقيق في القائمة
+            for pref in preferred_order:
+                for m in models:
+                    if pref in m['name']:
+                        return m['name'].replace('models/', '')
             
-            # 3. أي موديل جيميناي متاح
+            # لو ملقاش، هات أي حاجة فيها flash وخلاص (بس ابعد عن 2.5)
             for m in models:
-                name = m['name']
-                methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods and 'gemini' in name:
-                    return name.replace('models/', '')
-        
-        return "gemini-1.5-flash" # اسم احتياطي
+                if 'flash' in m['name'] and '1.5' in m['name']:
+                    return m['name'].replace('models/', '')
+                    
+        return "gemini-1.5-flash" # Default
     except:
         return "gemini-1.5-flash"
 
-# --- 2. دوال التنسيق (الإطار والخط) ---
+# --- 2. دوال التنسيق ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -99,9 +97,8 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- 3. دالة التحليل (الديناميكية) ---
-def call_gemini_dynamic(api_key, model_name, image_bytes, mime_type="image/jpeg"):
-    # نستخدم الموديل اللي الدالة اللي فوق جابته
+# --- 3. دالة التحليل ---
+def call_gemini_stable_version(api_key, model_name, image_bytes, mime_type="image/jpeg"):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
@@ -129,22 +126,23 @@ def call_gemini_dynamic(api_key, model_name, image_bytes, mime_type="image/jpeg"
         ]
     }
     
+    # 3 محاولات
     for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            elif response.status_code == 429: # لو زحمة
+            elif response.status_code == 429: # Server Busy
                 time.sleep(5)
                 continue
-            else: # خطأ آخر
+            else:
                 time.sleep(2)
                 continue
         except:
             time.sleep(2)
             continue
 
-    return f"Error: Failed to process image using {model_name}"
+    return f"Error: Failed to process using {model_name}. Status: {response.status_code if 'response' in locals() else 'Unknown'}"
 
 # --- 4. دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -160,7 +158,7 @@ def send_feedback_to_sheet(feedback_text):
         return True
     except Exception as e: return str(e)
 
-# --- الواجهة الرئيسية ---
+# --- الواجهة ---
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
@@ -179,12 +177,11 @@ uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "p
 
 if uploaded_files and st.button("Start Processing 🚀"):
     
-    # 1. الخطوة الذكية: نجيب اسم الموديل الشغال دلوقتي حالا
-    with st.spinner("Connecting to Google Servers..."):
-        active_model = get_auto_model_name(api_key)
+    # تحديد الموديل المستقر
+    with st.spinner("Selecting best stable model..."):
+        active_model = get_stable_model_name(api_key)
     
-    # رسالة تطمئنك إنه لقى موديل
-    st.toast(f"Connected using: {active_model}", icon="✅")
+    st.toast(f"Using Stable Model: {active_model}", icon="🛡️")
     
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
@@ -197,7 +194,6 @@ if uploaded_files and st.button("Start Processing 🚀"):
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        # حلقة المعالجة
         for i, file in enumerate(uploaded_files):
             st.write(f"📂 Reading: {file.name}")
             
@@ -210,8 +206,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         
-                        # نبعت الموديل اللي اكتشفناه (active_model)
-                        text = call_gemini_dynamic(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
+                        text = call_gemini_stable_version(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
                         
                         if not hide_img_name:
                             doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
@@ -229,14 +224,14 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        time.sleep(2) 
+                        time.sleep(2)
                         
                 except Exception as e:
                     st.error(f"Error reading PDF: {e}")
             
             else:
                 st.write(f"🖼️ Analyzing Image...")
-                text = call_gemini_dynamic(api_key, active_model, file.getvalue(), file.type)
+                text = call_gemini_stable_version(api_key, active_model, file.getvalue(), file.type)
                 
                 if not hide_img_name:
                     doc.add_heading(file.name, level=1)
