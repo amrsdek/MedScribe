@@ -8,6 +8,7 @@ import io
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+import time
 
 # --- 1. إعداد الصفحة ---
 st.set_page_config(page_title="المساعد الطبي - Medical Notes", page_icon="🩺", layout="centered")
@@ -25,34 +26,38 @@ hide_streamlit_style = """
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
-# --- 2. دالة ذكية لاختيار الموديل المتاح ---
-def get_best_model(api_key):
-    """دالة تكتشف الموديلات المتاحة وتختار أفضل واحد تلقائياً"""
+# --- 2. دالة اختبار الموديل (تعديل جذري) ---
+def get_working_model(api_key):
+    """
+    تجربة قائمة من الموديلات بالترتيب للعثور على موديل يعمل
+    ولا يعطي خطأ 404 أو 429
+    """
     genai.configure(api_key=api_key)
-    try:
-        # نجيب كل الموديلات المتاحة للمفتاح ده
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        # ترتيب الأولويات: فلاش الجديد > برو الجديد > القديم
-        priorities = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
-        
-        # لو لقينا واحد من الأولويات، ناخده
-        for priority in priorities:
-            for model in available_models:
-                if priority in model:
-                    return model
-        
-        # لو ملقيناش المفضلين، ناخد أول واحد شغال وخلاص
-        if available_models:
-            return available_models[0]
-        else:
-            return "models/gemini-pro" # احتياطي
+    
+    # قائمة الموديلات المراد تجربتها (الأخف والأسرع أولاً)
+    # نبدأ بالفلاش لأنه الأنسب للطلبة (سريع ومجاني)
+    candidate_models = [
+        'gemini-1.5-flash', 
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash-001',
+        'gemini-1.5-pro-latest', # لو الفلاش مش متاح نجرب البرو
+        'gemini-pro-vision',     # القديم المضمون
+    ]
+    
+    for model_name in candidate_models:
+        try:
+            # تجربة وهمية بسيطة للتأكد من الموديل
+            model = genai.GenerativeModel(model_name)
+            # نرسل رسالة نصية بسيطة جداً للاختبار (بدون صور لتوفير الكوتا)
+            # نستخدم generate_content مع نص فقط للاختبار السريع
+            response = model.generate_content("test")
+            return model_name # لو نجح نرجعه فوراً
+        except Exception as e:
+            # لو فشل نجرب اللي بعده
+            continue
             
-    except Exception as e:
-        return "models/gemini-pro" # لو حصل خطأ في الكشف نرجع للقديم
+    # لو كله فشل، نرجع للفلاش كخيار افتراضي وربنا يسهل
+    return 'gemini-1.5-flash'
 
 # --- 3. دوال العمليات الطبية ---
 def create_medical_doc():
@@ -68,12 +73,8 @@ def create_medical_doc():
     h1.font.color.rgb = RGBColor(13, 71, 161)
     return doc
 
-def process_image_with_gemini(image, api_key):
+def process_image_with_gemini(image, api_key, model_name):
     try:
-        # هنا التعديل السحري: بنجيب الموديل الشغال أوتوماتيك
-        model_name = get_best_model(api_key)
-        
-        # إعداد الموديل بالاسم اللي لقيناه
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
         
@@ -87,7 +88,10 @@ def process_image_with_gemini(image, api_key):
         response = model.generate_content([prompt, image])
         return response.text
     except Exception as e:
-        return f"Error ({model_name}): {str(e)}"
+        # لو حصل خطأ Quota أثناء التشغيل، نطلب من المستخدم الانتظار
+        if "429" in str(e):
+            return "Error: Quota exceeded. Please wait a minute and try again."
+        return f"Error: {str(e)}"
 
 # --- 4. الواجهة الجانبية ---
 with st.sidebar:
@@ -110,21 +114,27 @@ if uploaded_files and st.button("تحويل وتنسيق الملف 📝"):
     if not api_key:
         st.error("الرجاء إدخال مفتاح API.")
     else:
+        # 1. البحث عن أفضل موديل متاح الآن
+        with st.spinner("جاري البحث عن أفضل سيرفر متاح..."):
+            best_model = get_working_model(api_key)
+            st.toast(f"تم الاتصال بالسيرفر: {best_model}", icon="🚀")
+        
         progress = st.progress(0)
         doc = create_medical_doc()
         doc.add_heading('Medical Study Summary', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        # عرض الموديل المستخدم (عشان نطمن)
-        active_model = get_best_model(api_key)
-        st.caption(f"يتم المعالجة باستخدام: {active_model}")
-        
         for i, file in enumerate(uploaded_files):
             img = Image.open(file)
-            text = process_image_with_gemini(img, api_key)
+            # نمرر اسم الموديل اللي اخترناه للدالة
+            text = process_image_with_gemini(img, api_key, best_model)
+            
             doc.add_heading(f'Page: {file.name}', level=1)
             doc.add_paragraph(text)
             doc.add_page_break()
             progress.progress((i + 1) / len(uploaded_files))
+            
+            # تأخير بسيط جداً (ثانية واحدة) لتجنب ضغط السيرفر
+            time.sleep(1) 
             
         bio = io.BytesIO()
         doc.save(bio)
