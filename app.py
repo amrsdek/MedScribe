@@ -12,6 +12,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
+from pdf2image import convert_from_bytes # المكتبة الجديدة
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -25,35 +26,25 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("حول صور المحاضرات والكتب إلى ملف Word منسق.")
+st.write("حول صور المحاضرات أو ملفات PDF (Scanned) إلى ملف Word منسق.")
 
-# --- 1. دالة إضافة الإطار (Page Borders) ---
+# --- دوال التنسيق والإطار ---
 def add_page_borders(doc):
-    """
-    تضيف إطاراً للصفحة (Box Border) بسمك 1.5 pt
-    مطابق للصورة التي أرسلتها.
-    """
     sections = doc.sections
     for section in sections:
         sectPr = section._sectPr
-        # إنشاء عنصر حدود الصفحة
         pgBorders = OxmlElement('w:pgBorders')
-        pgBorders.set(qn('w:offsetFrom'), 'page') # المسافة من حافة الصفحة
-        
-        # إضافة الحدود الأربعة (فوق، تحت، يمين، يسار)
+        pgBorders.set(qn('w:offsetFrom'), 'page')
         for border_name in ('top', 'left', 'bottom', 'right'):
             border = OxmlElement(f'w:{border_name}')
-            border.set(qn('w:val'), 'single')  # خط متصل
-            border.set(qn('w:sz'), '12')       # الحجم: 12 وحدة = 1.5 نقطة (لأن النقطة = 8 وحدات)
-            border.set(qn('w:space'), '24')    # المسافة
-            border.set(qn('w:color'), 'auto')  # اللون: تلقائي (أسود)
+            border.set(qn('w:val'), 'single')
+            border.set(qn('w:sz'), '12')
+            border.set(qn('w:space'), '24')
+            border.set(qn('w:color'), 'auto')
             pgBorders.append(border)
-        
         sectPr.append(pgBorders)
 
-# --- 2. دالة تنسيق الخطوط (Times New Roman) ---
 def setup_word_styles(doc):
-    # تنسيق النص العادي (12 - Not Bold)
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Times New Roman'
@@ -63,30 +54,27 @@ def setup_word_styles(doc):
     rPr.rFonts.set(qn('w:ascii'), 'Times New Roman')
     rPr.rFonts.set(qn('w:hAnsi'), 'Times New Roman')
     
-    # تنسيق العناوين (14 - Bold)
     h1_style = doc.styles['Heading 1']
     h1_font = h1_style.font
     h1_font.name = 'Times New Roman'
     h1_font.size = Pt(14)
     h1_font.bold = True
-    h1_font.color.rgb = None # لون أسود
+    h1_font.color.rgb = None
 
-# --- 3. دالة التحليل (مع كشف العناوين) ---
-def call_gemini_medical_with_retry(api_key, image_bytes, mime_type):
+# --- دالة التحليل ---
+def call_gemini_medical_with_retry(api_key, image_bytes, mime_type="image/jpeg"):
     model_name = "gemini-2.5-flash"
-    if mime_type == 'image/jpg': mime_type = 'image/jpeg'
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     b64_image = base64.b64encode(image_bytes).decode('utf-8')
     headers = {'Content-Type': 'application/json'}
     
-    # التعديل هنا: نطلب منه استخدام # للعناوين
     medical_prompt = """
     You are an expert Medical Scribe. Analyze this medical image.
     1. Extract all text accurately.
     2. **Headings:** If you see a clear TITLE or HEADING in the image, start that line with a hash symbol (#). Example: "# Anatomy of Heart".
     3. **Body Text:** Write normal text as is.
-    4. Do NOT use any other markdown (like **bold** or italics). Just plain text and # for headings.
+    4. Do NOT use any other markdown.
     """
     
     safety_settings = [
@@ -117,7 +105,7 @@ def call_gemini_medical_with_retry(api_key, image_bytes, mime_type):
             continue
     return "Server Error"
 
-# --- 4. دالة الفيدباك ---
+# --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -131,66 +119,101 @@ def send_feedback_to_sheet(feedback_text):
         return True
     except Exception as e: return str(e)
 
-# --- الواجهة الرئيسية ---
+# --- الواجهة ---
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
     st.error("API Key missing.")
     st.stop()
 
-# إعدادات المستخدم
 col1, col2 = st.columns([3, 1])
 with col1:
     doc_name_input = st.text_input("اسم الملف (عنوان المذاكرة):", value="Medical Notes")
 with col2:
-    st.write("") # Spacer
     st.write("") 
-    # الخيار الجديد لإخفاء اسم الصورة
+    st.write("") 
     hide_img_name = st.checkbox("إخفاء اسم الصورة؟", value=False)
 
-uploaded_files = st.file_uploader("Upload Images", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
+# السماح برفع PDF وصور
+uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
-        setup_word_styles(doc) # تطبيق الخطوط
-        add_page_borders(doc)  # تطبيق الإطار (1.5 pt)
+        setup_word_styles(doc)
+        add_page_borders(doc)
         
-        # العنوان الرئيسي للملف (ياخد Heading 1 بس نكبره شوية يدوياً لو تحب، أو نسيبه Heading 1)
-        # هنا هنخليه Title عشان يبقى مميز في الأول
         title = doc.add_paragraph(doc_name_input, style='Title')
-        title.alignment = 1 # Center
+        title.alignment = 1 
         
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        for i, file in enumerate(uploaded_files):
-            st.write(f"Analyzing: {file.name}...")
-            text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
+        # حساب إجمالي عدد الملفات لضبط شريط التقدم
+        total_files_count = len(uploaded_files)
+        current_file_index = 0
+
+        for file in uploaded_files:
+            current_file_index += 1
             
-            # 1. هل نعرض اسم الصورة؟
-            if not hide_img_name:
-                # إضافة اسم الصورة كـ Heading 2 عشان يكون أصغر من العنوان الرئيسي
-                # أو Heading 1 حسب طلبك (أنت طلبت العناوين 14 Bold)
-                h = doc.add_heading(f'Image: {file.name}', level=1)
+            # 1. لو الملف PDF: فكه لصور
+            if file.type == "application/pdf":
+                st.write(f"📄 Extracting pages from PDF: {file.name}...")
+                try:
+                    # تحويل صفحات الـ PDF لصور
+                    images = convert_from_bytes(file.read())
+                    
+                    for page_num, img in enumerate(images):
+                        st.write(f"Analyzing Page {page_num + 1} of {file.name}...")
+                        
+                        # تحويل الصورة لـ Bytes عشان نبعتها لـ API
+                        img_byte_arr = io.BytesIO()
+                        img.save(img_byte_arr, format='JPEG')
+                        img_bytes = img_byte_arr.getvalue()
+                        
+                        text = call_gemini_medical_with_retry(api_key, img_bytes, "image/jpeg")
+                        
+                        if not hide_img_name:
+                            doc.add_heading(f'{file.name} - Page {page_num+1}', level=1)
+                        
+                        for line in text.split('\n'):
+                            line = line.strip()
+                            if not line: continue
+                            if line.startswith('#'):
+                                clean_line = line.replace('#', '').strip()
+                                doc.add_heading(clean_line, level=1)
+                            else:
+                                doc.add_paragraph(line)
+                        
+                        doc.add_page_break()
+                        full_text_preview += f"\n{text}\n"
+                        time.sleep(1) # راحة للسيرفر بين الصفحات
+
+                except Exception as e:
+                    st.error(f"Error reading PDF {file.name}: {e}")
             
-            # 2. معالجة النص سطر بسطر لاكتشاف العناوين الداخلية
-            for line in text.split('\n'):
-                line = line.strip()
-                if not line: continue
+            # 2. لو الملف صورة عادية
+            else:
+                st.write(f"🖼️ Analyzing Image: {file.name}...")
+                text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
                 
-                if line.startswith('#'):
-                    # ده عنوان فرعي في الورقة -> نخليه Heading 1 (14 Bold)
-                    clean_line = line.replace('#', '').strip()
-                    doc.add_heading(clean_line, level=1)
-                else:
-                    # ده نص عادي -> نخليه Normal (12 Regular)
-                    doc.add_paragraph(line)
-            
-            doc.add_page_break()
-            full_text_preview += f"\n{text}\n"
-            progress_bar.progress((i + 1) / len(uploaded_files))
-            time.sleep(1)
+                if not hide_img_name:
+                    doc.add_heading(f'Image: {file.name}', level=1)
+                
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith('#'):
+                        clean_line = line.replace('#', '').strip()
+                        doc.add_heading(clean_line, level=1)
+                    else:
+                        doc.add_paragraph(line)
+                
+                doc.add_page_break()
+                full_text_preview += f"\n{text}\n"
+                time.sleep(1)
+
+            progress_bar.progress(current_file_index / total_files_count)
         
         status.update(label="All Done!", state="complete", expanded=False)
         st.success("تم الانتهاء!")
