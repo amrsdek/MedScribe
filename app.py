@@ -42,7 +42,10 @@ def create_medical_doc():
 def process_image_with_gemini(image, api_key):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # تعديل هام: استخدام اسم الموديل الأكثر استقراراً
+        # لو gemini-1.5-flash-001 عمل مشكلة، جرب gemini-pro
+        model = genai.GenerativeModel('gemini-1.5-flash-001') 
+        
         prompt = """
         ACT AS A MEDICAL SCRIBE. Analyze this medical document image.
         1. Extract text accurately (drug names, doses, latin terms).
@@ -95,7 +98,7 @@ if uploaded_files and st.button("تحويل وتنسيق الملف 📝"):
 
 st.divider()
 
-# --- 5. قسم الدعوات (تم التعديل ليناسب المكتبة الخفيفة) ---
+# --- 5. قسم الدعوات ---
 st.subheader("💌 اترك أثراً طيباً")
 with st.form("feedback"):
     msg = st.text_area("رسالتك:")
@@ -103,27 +106,22 @@ with st.form("feedback"):
     
     if submit and msg:
         try:
-            # إعداد الاتصال بجوجل شيت بالطريقة الخفيفة
             scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-            # استدعاء البيانات من الأسرار
             secrets_dict = dict(st.secrets["connections"]["gsheets"])
             
-            # تصحيح بسيط لمفتاح Private Key لو فيه مشاكل في التنسيق
             if "\\n" in secrets_dict["private_key"]:
                 secrets_dict["private_key"] = secrets_dict["private_key"].replace("\\n", "\n")
             
             creds = Credentials.from_service_account_info(secrets_dict, scopes=scope)
             client = gspread.authorize(creds)
             
-            # فتح الشيت والكتابة فيه
             sheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
             sheet = client.open_by_url(sheet_url).sheet1
             
-            # إضافة الصف
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             sheet.append_row([current_time, msg])
             
             st.success("وصلت دعوتك، ولك بمثلها إن شاء الله!")
         except Exception as e:
             st.warning("حدث خطأ بسيط في الاتصال، لكن نيتك وصلت!")
-            print(e) # هيطبع الخطأ ليك انت في اللوجز لو حبيت تشوفه
+            print(e)
