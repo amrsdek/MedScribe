@@ -12,7 +12,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
-from pdf2image import convert_from_bytes # المكتبة الجديدة
+from pdf2image import convert_from_bytes
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -28,7 +28,7 @@ st.markdown("""
 st.title("🩺 Medical Study Assistant")
 st.write("حول صور المحاضرات أو ملفات PDF (Scanned) إلى ملف Word منسق.")
 
-# --- دوال التنسيق والإطار ---
+# --- دوال التنسيق ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -61,10 +61,9 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة التحليل ---
+# --- دالة التحليل (المعدلة للتعامل مع الضغط 429) ---
 def call_gemini_medical_with_retry(api_key, image_bytes, mime_type="image/jpeg"):
     model_name = "gemini-2.5-flash"
-    
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     b64_image = base64.b64encode(image_bytes).decode('utf-8')
     headers = {'Content-Type': 'application/json'}
@@ -89,21 +88,34 @@ def call_gemini_medical_with_retry(api_key, image_bytes, mime_type="image/jpeg")
         "safetySettings": safety_settings
     }
     
-    max_retries = 3
+    # محاولة حتى 5 مرات (بدل 3)
+    max_retries = 5
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
+            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            elif response.status_code == 503:
-                time.sleep(2)
+            
+            elif response.status_code == 429:
+                # لو الخطأ 429 (Too Many Requests)
+                wait_time = (attempt + 1) * 10  # استنى 10 ثواني، ثم 20، ثم 30...
+                st.warning(f"⚠️ ضغط عالي على السيرفر.. جاري الانتظار {wait_time} ثواني (محاولة {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
                 continue
+            
+            elif response.status_code == 503:
+                # لو الخطأ 503 (Service Unavailable)
+                time.sleep(5)
+                continue
+                
             else:
                 return f"Error {response.status_code}"
-        except:
-            time.sleep(1)
+        except Exception as e:
+            time.sleep(2)
             continue
-    return "Server Error"
+
+    return "Server is too busy. Try converting fewer pages at a time."
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -134,7 +146,6 @@ with col2:
     st.write("") 
     hide_img_name = st.checkbox("إخفاء اسم الصورة؟", value=False)
 
-# السماح برفع PDF وصور
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
@@ -149,24 +160,22 @@ if uploaded_files and st.button("Start Processing 🚀"):
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        # حساب إجمالي عدد الملفات لضبط شريط التقدم
         total_files_count = len(uploaded_files)
         current_file_index = 0
 
         for file in uploaded_files:
             current_file_index += 1
             
-            # 1. لو الملف PDF: فكه لصور
             if file.type == "application/pdf":
-                st.write(f"📄 Extracting pages from PDF: {file.name}...")
+                st.write(f"📄 Extracting PDF: {file.name}...")
                 try:
-                    # تحويل صفحات الـ PDF لصور
                     images = convert_from_bytes(file.read())
+                    # لو PDF كبير، ناخد راحة أطول بين الصفحات
+                    pdf_delay = 4 
                     
                     for page_num, img in enumerate(images):
-                        st.write(f"Analyzing Page {page_num + 1} of {file.name}...")
+                        st.write(f"Analyzing Page {page_num + 1}...")
                         
-                        # تحويل الصورة لـ Bytes عشان نبعتها لـ API
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         img_bytes = img_byte_arr.getvalue()
@@ -187,14 +196,14 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        time.sleep(1) # راحة للسيرفر بين الصفحات
+                        # استراحة إجبارية بين كل صفحة والتانية
+                        time.sleep(pdf_delay)
 
                 except Exception as e:
-                    st.error(f"Error reading PDF {file.name}: {e}")
+                    st.error(f"Error reading PDF: {e}")
             
-            # 2. لو الملف صورة عادية
             else:
-                st.write(f"🖼️ Analyzing Image: {file.name}...")
+                st.write(f"🖼️ Analyzing: {file.name}...")
                 text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
                 
                 if not hide_img_name:
@@ -211,7 +220,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
                 
                 doc.add_page_break()
                 full_text_preview += f"\n{text}\n"
-                time.sleep(1)
+                time.sleep(3) # استراحة 3 ثواني للصور العادية
 
             progress_bar.progress(current_file_index / total_files_count)
         
