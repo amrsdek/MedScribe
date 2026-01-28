@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# --- 1. إعداد الصفحة وإخفاء الهوية ---
+# --- 1. إعداد الصفحة ---
 st.set_page_config(page_title="المساعد الطبي - Medical Notes", page_icon="🩺", layout="centered")
 
 hide_streamlit_style = """
@@ -25,7 +25,36 @@ hide_streamlit_style = """
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
-# --- 2. دوال العمليات الطبية ---
+# --- 2. دالة ذكية لاختيار الموديل المتاح ---
+def get_best_model(api_key):
+    """دالة تكتشف الموديلات المتاحة وتختار أفضل واحد تلقائياً"""
+    genai.configure(api_key=api_key)
+    try:
+        # نجيب كل الموديلات المتاحة للمفتاح ده
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # ترتيب الأولويات: فلاش الجديد > برو الجديد > القديم
+        priorities = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
+        
+        # لو لقينا واحد من الأولويات، ناخده
+        for priority in priorities:
+            for model in available_models:
+                if priority in model:
+                    return model
+        
+        # لو ملقيناش المفضلين، ناخد أول واحد شغال وخلاص
+        if available_models:
+            return available_models[0]
+        else:
+            return "models/gemini-pro" # احتياطي
+            
+    except Exception as e:
+        return "models/gemini-pro" # لو حصل خطأ في الكشف نرجع للقديم
+
+# --- 3. دوال العمليات الطبية ---
 def create_medical_doc():
     doc = Document()
     style = doc.styles['Normal']
@@ -41,10 +70,12 @@ def create_medical_doc():
 
 def process_image_with_gemini(image, api_key):
     try:
+        # هنا التعديل السحري: بنجيب الموديل الشغال أوتوماتيك
+        model_name = get_best_model(api_key)
+        
+        # إعداد الموديل بالاسم اللي لقيناه
         genai.configure(api_key=api_key)
-        # تعديل هام: استخدام اسم الموديل الأكثر استقراراً
-        # الموديل الكلاسيكي المخصص للصور
-        model = genai.GenerativeModel('gemini-pro-vision')
+        model = genai.GenerativeModel(model_name)
         
         prompt = """
         ACT AS A MEDICAL SCRIBE. Analyze this medical document image.
@@ -56,9 +87,9 @@ def process_image_with_gemini(image, api_key):
         response = model.generate_content([prompt, image])
         return response.text
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error ({model_name}): {str(e)}"
 
-# --- 3. الواجهة الجانبية ---
+# --- 4. الواجهة الجانبية ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2966/2966327.png", width=80)
     st.title("إعدادات")
@@ -68,7 +99,7 @@ with st.sidebar:
     else:
         api_key = st.text_input("Gemini API Key", type="password")
 
-# --- 4. الواجهة الرئيسية ---
+# --- 5. الواجهة الرئيسية ---
 st.title("🩺 Medical Notes Converter")
 st.write("صدقة جارية | أداة لتحويل صور المذكرات الطبية إلى ملفات Word منسقة للمذاكرة.")
 st.divider()
@@ -82,6 +113,10 @@ if uploaded_files and st.button("تحويل وتنسيق الملف 📝"):
         progress = st.progress(0)
         doc = create_medical_doc()
         doc.add_heading('Medical Study Summary', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # عرض الموديل المستخدم (عشان نطمن)
+        active_model = get_best_model(api_key)
+        st.caption(f"يتم المعالجة باستخدام: {active_model}")
         
         for i, file in enumerate(uploaded_files):
             img = Image.open(file)
@@ -98,7 +133,7 @@ if uploaded_files and st.button("تحويل وتنسيق الملف 📝"):
 
 st.divider()
 
-# --- 5. قسم الدعوات ---
+# --- 6. قسم الدعوات ---
 st.subheader("💌 اترك أثراً طيباً")
 with st.form("feedback"):
     msg = st.text_area("رسالتك:")
@@ -125,5 +160,3 @@ with st.form("feedback"):
         except Exception as e:
             st.warning("حدث خطأ بسيط في الاتصال، لكن نيتك وصلت!")
             print(e)
-
-
