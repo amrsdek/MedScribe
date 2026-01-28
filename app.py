@@ -1,39 +1,70 @@
 import streamlit as st
-import google.generativeai as genai
-from docx import Document
-from docx.shared import Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from PIL import Image
-import io
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime
-import time
 
-# --- إعداد الصفحة ---
-st.set_page_config(page_title="Medical Notes Converter", page_icon="🩺", layout="centered")
+# 1. إعداد الصفحة (لازم يكون أول أمر)
+st.set_page_config(page_title="Medical Notes", page_icon="🩺", layout="centered")
 
-# --- دالة العثور على الموديل الشغال (خطة أ، ب، ج) ---
-def get_working_model(api_key):
-    genai.configure(api_key=api_key)
-    
-    # هذه القائمة مرتبة من الأحدث للأقدم
-    # الكود سيجربهم واحداً تلو الآخر حتى يجد واحداً يعمل
-    models_to_test = [
-        'gemini-1.5-flash-001', # الاسم الرسمي الكامل (غالباً هو الحل)
-        'gemini-1.5-flash',     # الاسم المختصر
-        'gemini-1.5-pro',       # الخيار القوي البديل
-        'gemini-pro-vision',    # القديم المضمون (يعمل دائماً)
-    ]
-    
-    for model_name in models_to_test:
-        try:
-            # تجربة سريعة جداً للتأكد أن الموديل "حي" ولا يعطي 404
-            model = genai.GenerativeModel(model_name)
-            # نطلب منه كلمة واحدة فقط للاختبار
-            model.generate_content("test")
-            return model # إذا نجح، نستخدمه ونخرج من الدالة فوراً
-        except Exception:
-            continue # لو فشل، نجرب اللي بعده بصمت
+# محاولة استيراد المكتبات داخل try-except لكشف سبب الشاشة البيضاء
+try:
+    import google.generativeai as genai
+    from docx import Document
+    from PIL import Image
+    import io
+    import time
+except Exception as e:
+    st.error(f"حدث خطأ في تحميل المكتبات: {e}")
+    st.stop()
+
+# --- الواجهة ---
+st.title("🩺 Medical Notes Converter")
+st.write("نسخة الإصلاح السريع - Basic Version")
+
+# الشريط الجانبي
+with st.sidebar:
+    st.header("الإعدادات")
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        st.success("المفتاح متصل ✅")
+    else:
+        api_key = st.text_input("Gemini API Key", type="password")
+
+# دالة التحويل المباشرة (بدون لف ودوران)
+def convert_image(image, api_key):
+    try:
+        genai.configure(api_key=api_key)
+        # استخدام الفلاش الرسمي مباشرة
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = "Extract medical text from this image and format it nicely."
+        response = model.generate_content([prompt, image])
+        return response.text
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# الرفع والتحويل
+uploaded_files = st.file_uploader("ارفع الصور", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+
+if uploaded_files and st.button("بدء التحويل"):
+    if not api_key:
+        st.warning("⚠️ الرجاء إدخال API Key")
+    else:
+        progress = st.progress(0)
+        # إنشاء ملف وورد بسيط
+        doc = Document()
+        doc.add_heading('Medical Summary', 0)
+        
+        for i, file in enumerate(uploaded_files):
+            img = Image.open(file)
+            st.caption(f"جاري معالجة: {file.name}...")
             
-    # لو كل دول فشلوا (مستحيل يحصل)، نرجع القديم وخ
+            text = convert_image(img, api_key)
+            
+            doc.add_heading(f'Page: {file.name}', level=1)
+            doc.add_paragraph(text)
+            doc.add_page_break()
+            progress.progress((i + 1) / len(uploaded_files))
+            
+        # التحميل
+        bio = io.BytesIO()
+        doc.save(bio)
+        st.success("تم الانتهاء!")
+        st.download_button("📥 تحميل الملف", bio.getvalue(), "Medical_Notes.docx")
