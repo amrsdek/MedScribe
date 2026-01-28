@@ -26,9 +26,9 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("حول صور المحاضرات والكتب إلى ملف Word منسق.")
+st.write("النسخة الذكية (Auto-Detect + PDF Support).")
 
-# --- 1. الدالة المنقذة (اكتشاف الموديل تلقائياً) ---
+# --- 1. دالة اكتشاف الموديل (الحل الجذري للـ 404) ---
 def get_auto_model_name(api_key):
     """
     تتصل بجوجل وتجلب الاسم الرسمي للموديل المتاح حالياً
@@ -41,18 +41,18 @@ def get_auto_model_name(api_key):
             data = response.json()
             models = data.get('models', [])
             
-            # 1. نبحث عن Flash (الأسرع والأرخص)
+            # 1. نبحث عن أي موديل Flash (الأسرع والأرخص)
             for m in models:
                 name = m['name']
                 methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods and 'flash' in name and '1.5' in name:
+                if 'generateContent' in methods and 'flash' in name:
                     return name.replace('models/', '') # نرجع الاسم الصح
             
             # 2. لو مفيش، نبحث عن Pro
             for m in models:
                 name = m['name']
                 methods = m.get('supportedGenerationMethods', [])
-                if 'generateContent' in methods and 'pro' in name and '1.5' in name:
+                if 'generateContent' in methods and 'pro' in name:
                     return name.replace('models/', '')
             
             # 3. أي موديل جيميناي متاح
@@ -62,7 +62,7 @@ def get_auto_model_name(api_key):
                 if 'generateContent' in methods and 'gemini' in name:
                     return name.replace('models/', '')
         
-        return "gemini-1.5-flash" # اسم افتراضي لو البحث فشل
+        return "gemini-1.5-flash" # اسم احتياطي
     except:
         return "gemini-1.5-flash"
 
