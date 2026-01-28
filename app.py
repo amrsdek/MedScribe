@@ -26,11 +26,48 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🩺 Medical Study Assistant")
-st.write("النسخة المستقرة (تنسيق طبي + PDF).")
+st.write("حول صور المحاضرات والكتب إلى ملف Word منسق.")
 
-# --- 1. دوال التنسيق (الإطار والخطوط) ---
+# --- 1. الدالة المنقذة (اكتشاف الموديل تلقائياً) ---
+def get_auto_model_name(api_key):
+    """
+    تتصل بجوجل وتجلب الاسم الرسمي للموديل المتاح حالياً
+    لتجنب خطأ 404 نهائياً.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get('models', [])
+            
+            # 1. نبحث عن Flash (الأسرع والأرخص)
+            for m in models:
+                name = m['name']
+                methods = m.get('supportedGenerationMethods', [])
+                if 'generateContent' in methods and 'flash' in name and '1.5' in name:
+                    return name.replace('models/', '') # نرجع الاسم الصح
+            
+            # 2. لو مفيش، نبحث عن Pro
+            for m in models:
+                name = m['name']
+                methods = m.get('supportedGenerationMethods', [])
+                if 'generateContent' in methods and 'pro' in name and '1.5' in name:
+                    return name.replace('models/', '')
+            
+            # 3. أي موديل جيميناي متاح
+            for m in models:
+                name = m['name']
+                methods = m.get('supportedGenerationMethods', [])
+                if 'generateContent' in methods and 'gemini' in name:
+                    return name.replace('models/', '')
+        
+        return "gemini-1.5-flash" # اسم افتراضي لو البحث فشل
+    except:
+        return "gemini-1.5-flash"
+
+# --- 2. دوال التنسيق (الإطار والخط) ---
 def add_page_borders(doc):
-    """إضافة إطار للصفحة (Box Border)"""
     sections = doc.sections
     for section in sections:
         sectPr = section._sectPr
@@ -39,14 +76,13 @@ def add_page_borders(doc):
         for border_name in ('top', 'left', 'bottom', 'right'):
             border = OxmlElement(f'w:{border_name}')
             border.set(qn('w:val'), 'single')
-            border.set(qn('w:sz'), '12') # 1.5 pt
+            border.set(qn('w:sz'), '12')
             border.set(qn('w:space'), '24')
             border.set(qn('w:color'), 'auto')
             pgBorders.append(border)
         sectPr.append(pgBorders)
 
 def setup_word_styles(doc):
-    """ضبط الخط Times New Roman"""
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Times New Roman'
@@ -56,18 +92,16 @@ def setup_word_styles(doc):
     rPr.rFonts.set(qn('w:ascii'), 'Times New Roman')
     rPr.rFonts.set(qn('w:hAnsi'), 'Times New Roman')
     
-    # تنسيق العنوان (Heading 1) ليكون 14 Bold
     h1_style = doc.styles['Heading 1']
     h1_font = h1_style.font
     h1_font.name = 'Times New Roman'
     h1_font.size = Pt(14)
     h1_font.bold = True
-    h1_font.color.rgb = None # أسود
+    h1_font.color.rgb = None
 
-# --- 2. دالة الاتصال (Gemini 1.5 Flash - الأكثر استقراراً) ---
-def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
-    # اخترنا 1.5 لأنه مستقر جداً ومش بيعمل مشاكل مع الباقة المجانية
-    model_name = "gemini-1.5-flash"
+# --- 3. دالة التحليل (الديناميكية) ---
+def call_gemini_dynamic(api_key, model_name, image_bytes, mime_type="image/jpeg"):
+    # نستخدم الموديل اللي الدالة اللي فوق جابته
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
@@ -77,13 +111,12 @@ def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
 
     headers = {'Content-Type': 'application/json'}
     
-    # التعليمات الطبية
     medical_prompt = """
     You are an expert Medical Scribe. Analyze this medical image.
     1. Extract all text accurately.
-    2. **Headings:** If you see a clear TITLE or HEADING, start the line with # (e.g., # Anatomy of Heart).
+    2. **Headings:** If you see a clear TITLE or HEADING, start the line with # (e.g., # Anatomy).
     3. **Body Text:** Write normal text as is.
-    4. Do NOT use any other markdown symbols (like ** or ##), only # for main headings.
+    4. Do NOT use any other markdown.
     """
     
     payload = {
@@ -96,25 +129,24 @@ def call_gemini_stable(api_key, image_bytes, mime_type="image/jpeg"):
         ]
     }
     
-    # محاولة 3 مرات في حالة الخطأ
     for attempt in range(3):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            elif response.status_code == 429: # لو السيرفر زحمة
+            elif response.status_code == 429: # لو زحمة
                 time.sleep(5)
                 continue
-            else:
+            else: # خطأ آخر
                 time.sleep(2)
                 continue
         except:
             time.sleep(2)
             continue
 
-    return f"Error: Failed to process image (Status: {response.status_code})"
+    return f"Error: Failed to process image using {model_name}"
 
-# --- 3. دالة الفيدباك ---
+# --- 4. دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -146,25 +178,29 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
+    
+    # 1. الخطوة الذكية: نجيب اسم الموديل الشغال دلوقتي حالا
+    with st.spinner("Connecting to Google Servers..."):
+        active_model = get_auto_model_name(api_key)
+    
+    # رسالة تطمئنك إنه لقى موديل
+    st.toast(f"Connected using: {active_model}", icon="✅")
+    
     with st.status("Processing...", expanded=True) as status:
         doc = Document()
-        
-        # تطبيق التنسيقات (الخط والإطار)
         setup_word_styles(doc)
         add_page_borders(doc)
         
-        # إضافة العنوان الرئيسي
         title = doc.add_paragraph(doc_name_input, style='Title')
         title.alignment = 1 
         
         full_text_preview = ""
         progress_bar = st.progress(0)
         
-        # حلقة المعالجة (واحدة واحدة عشان الاستقرار)
+        # حلقة المعالجة
         for i, file in enumerate(uploaded_files):
             st.write(f"📂 Reading: {file.name}")
             
-            # 1. لو PDF
             if file.type == "application/pdf":
                 try:
                     images = convert_from_bytes(file.read())
@@ -174,47 +210,51 @@ if uploaded_files and st.button("Start Processing 🚀"):
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
                         
-                        # إرسال للموديل
-                        text = call_gemini_stable(api_key, img_byte_arr.getvalue(), "image/jpeg")
+                        # نبعت الموديل اللي اكتشفناه (active_model)
+                        text = call_gemini_dynamic(api_key, active_model, img_byte_arr.getvalue(), "image/jpeg")
                         
-                        # الكتابة في الوورد
                         if not hide_img_name:
                             doc.add_heading(f"{file.name} (Page {page_idx+1})", level=1)
                         
-                        for line in text.split('\n'):
-                            line = line.strip()
-                            if not line: continue
-                            if line.startswith('#'):
-                                doc.add_heading(line.replace('#', '').strip(), level=1)
-                            else:
-                                doc.add_paragraph(line)
+                        if "Error:" in text:
+                             st.error(f"Failed page {page_idx+1}: {text}")
+                        else:
+                            for line in text.split('\n'):
+                                line = line.strip()
+                                if not line: continue
+                                if line.startswith('#'):
+                                    doc.add_heading(line.replace('#', '').strip(), level=1)
+                                else:
+                                    doc.add_paragraph(line)
                         
                         doc.add_page_break()
                         full_text_preview += f"\n{text}\n"
-                        time.sleep(2) # استراحة 2 ثانية للأمان
+                        time.sleep(2) 
                         
                 except Exception as e:
                     st.error(f"Error reading PDF: {e}")
             
-            # 2. لو صور عادية
             else:
                 st.write(f"🖼️ Analyzing Image...")
-                text = call_gemini_stable(api_key, file.getvalue(), file.type)
+                text = call_gemini_dynamic(api_key, active_model, file.getvalue(), file.type)
                 
                 if not hide_img_name:
                     doc.add_heading(file.name, level=1)
                 
-                for line in text.split('\n'):
-                    line = line.strip()
-                    if not line: continue
-                    if line.startswith('#'):
-                        doc.add_heading(line.replace('#', '').strip(), level=1)
-                    else:
-                        doc.add_paragraph(line)
+                if "Error:" in text:
+                     st.error(f"Failed image: {text}")
+                else:
+                    for line in text.split('\n'):
+                        line = line.strip()
+                        if not line: continue
+                        if line.startswith('#'):
+                            doc.add_heading(line.replace('#', '').strip(), level=1)
+                        else:
+                            doc.add_paragraph(line)
                 
                 doc.add_page_break()
                 full_text_preview += f"\n{text}\n"
-                time.sleep(2) # استراحة 2 ثانية
+                time.sleep(2)
 
             progress_bar.progress((i + 1) / len(uploaded_files))
         
