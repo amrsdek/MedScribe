@@ -12,39 +12,23 @@ from datetime import datetime
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
 
+# تنسيق CSS عشان يخفي أي حاجة مش مهمة ويخلي الشكل بسيط
 st.markdown("""
     <style>
     .main { direction: rtl; }
     h1 { color: #2E86C1; }
-    .stSelectbox { direction: ltr; } 
+    .stDeployButton {display:none;} /* إخفاء زرار النشر */
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🩺 مساعد المذاكرة لطلبة طب")
-st.info("نظام اختيار الموديل الذكي: اختر الموديل المتاح من القائمة أدناه لتجنب الأخطاء.")
+st.title("🩺 Medical Study Assistant")
+st.write("حول صور المحاضرات والكتب إلى ملف Word منسق.")
 
-# --- 1. دالة جلب الموديلات المتاحة (الحل الجذري) ---
-def get_working_models(api_key):
-    """تجلب قائمة الموديلات المتاحة فعلياً لهذا المفتاح"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            # نختار فقط الموديلات اللي بتدعم التخاطب (generateContent)
-            models = [
-                m['name'].replace('models/', '') 
-                for m in data.get('models', []) 
-                if 'generateContent' in m.get('supportedGenerationMethods', [])
-            ]
-            return models
-        else:
-            return []
-    except:
-        return []
-
-# --- 2. دالة التحليل الطبي ---
-def call_gemini_medical(api_key, model_name, image_bytes, mime_type):
+# --- 1. دالة التحليل الطبي (مثبتة على الموديل الجديد) ---
+def call_gemini_medical(api_key, image_bytes, mime_type):
+    # تثبيت الموديل اللي نجح معاك
+    model_name = "gemini-2.5-flash"
+    
     if mime_type == 'image/jpg': mime_type = 'image/jpeg'
         
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -61,7 +45,6 @@ def call_gemini_medical(api_key, model_name, image_bytes, mime_type):
     - Format output with clear headings and bullet points.
     """
     
-    # إعدادات الأمان لفتح صور التشريح
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -88,12 +71,12 @@ def call_gemini_medical(api_key, model_name, image_bytes, mime_type):
     except Exception as e:
         return f"Connection Error: {str(e)}"
 
-# --- 3. دالة الفيدباك ---
+# --- 2. دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         if "gcp_service_account" not in st.secrets:
-            return "بيانات الشيت غير موجودة"
+            return "Missing Credentials"
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
@@ -104,71 +87,56 @@ def send_feedback_to_sheet(feedback_text):
     except Exception as e:
         return str(e)
 
-# --- الواجهة الرئيسية ---
+# --- الواجهة الرئيسية (المبسطة) ---
+
+# استدعاء المفتاح من الأسرار فقط (مخفي عن الطالب)
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
-    api_key = st.sidebar.text_input("Gemini API Key", type="password")
+    st.error("System Configuration Error: API Key missing.")
+    st.stop()
 
-# --- قائمة اختيار الموديل (الجزء الجديد) ---
-available_models = []
-if api_key:
-    available_models = get_working_models(api_key)
+uploaded_files = st.file_uploader("Upload Medical Images / Slides", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
 
-if available_models:
-    # محاولة اختيار Flash تلقائياً لو موجود
-    default_index = 0
-    for i, m in enumerate(available_models):
-        if 'flash' in m and '1.5' in m:
-            default_index = i
-            break
-    
-    selected_model = st.selectbox(
-        "اختر الموديل (تأكد من اختيار موديل يدعم الرؤية Vision):", 
-        available_models, 
-        index=default_index
-    )
-    st.caption(f"✅ سيتم استخدام الموديل: {selected_model}")
-else:
-    if api_key:
-        st.error("⚠️ لم يتم العثور على موديلات متاحة لهذا المفتاح. تأكد من صلاحية الـ API Key.")
-    selected_model = "gemini-1.5-flash" # احتياطي
-
-uploaded_files = st.file_uploader("ارفع الصور الطبية", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
-
-if uploaded_files and st.button("Start Processing 🧬"):
-    if not api_key:
-        st.error("الرجاء التأكد من وجود API Key")
-    else:
-        with st.status("جاري تحليل البيانات الطبية...", expanded=True):
-            doc = Document()
-            doc.add_heading('Medical Notes', 0)
-            full_text_preview = ""
+if uploaded_files and st.button("Start Processing 🚀"):
+    with st.status("Analyzing Medical Data...", expanded=True):
+        doc = Document()
+        doc.add_heading('Medical Study Notes', 0)
+        full_text_preview = ""
+        
+        progress_bar = st.progress(0)
+        for i, file in enumerate(uploaded_files):
+            st.write(f"Processing page {i+1}...")
+            # استدعاء الدالة مباشرة بدون تمرير اسم الموديل (لأنه ثابت جوه)
+            text = call_gemini_medical(api_key, file.getvalue(), file.type)
             
-            progress_bar = st.progress(0)
-            for i, file in enumerate(uploaded_files):
-                st.write(f"Analyzing: {file.name}")
-                text = call_gemini_medical(api_key, selected_model, file.getvalue(), file.type)
-                
-                doc.add_heading(f'Source: {file.name}', level=1)
-                doc.add_paragraph(text)
-                doc.add_page_break()
-                full_text_preview += f"--- {file.name} ---\n{text}\n\n"
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            st.success("تم الانتهاء! جاهز للتحميل.")
-            bio = io.BytesIO()
-            doc.save(bio)
-            st.download_button("📥 Download Word File", bio.getvalue(), "Medical_Notes.docx")
-            
-            with st.expander("Preview"):
-                st.text(full_text_preview)
+            doc.add_heading(f'Source: {file.name}', level=1)
+            doc.add_paragraph(text)
+            doc.add_page_break()
+            full_text_preview += f"--- {file.name} ---\n{text}\n\n"
+            progress_bar.progress((i + 1) / len(uploaded_files))
+        
+        st.success("Completed successfully!")
+        bio = io.BytesIO()
+        doc.save(bio)
+        
+        # زر التحميل الكبير الواضح
+        st.download_button(
+            label="📥 Download Word File Now",
+            data=bio.getvalue(),
+            file_name="Medical_Notes.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary" 
+        )
+        
+        with st.expander("Show Preview"):
+            st.text(full_text_preview)
 
 st.markdown("---")
-st.header("📝 Feedback")
+st.caption("Feedback Box")
 with st.form("feedback"):
-    fb = st.text_area("ملاحظاتك:")
-    if st.form_submit_button("إرسال"):
+    fb = st.text_area("واجهت مشكلة؟ أو عندك اقتراح؟ اكتبه هنا:")
+    if st.form_submit_button("Send Feedback"):
         res = send_feedback_to_sheet(fb)
-        if res == True: st.success("تم الإرسال!")
-        else: st.error(f"خطأ: {res}")
+        if res == True: st.success("Thanks for your feedback!")
+        else: st.error("Error sending feedback.")
