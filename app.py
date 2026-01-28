@@ -13,7 +13,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
 from pdf2image import convert_from_bytes
-import concurrent.futures # مكتبة المعالجة المتوازية
+import concurrent.futures
+import random # عشان نعمل توقيتات عشوائية تمنع التصادم
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -26,7 +27,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🩺 Medical Study Assistant (Parallel Mode ⚡)")
+st.title("🩺 Medical Study Assistant (Stable Mode 🛡️)")
 
 # --- دوال التنسيق ---
 def add_page_borders(doc):
@@ -61,19 +62,15 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة العامل الواحد (Worker Function) ---
+# --- دالة العامل الواحد (Robust Worker) ---
 def process_single_image_task(api_key, image_bytes, index, file_name):
-    """
-    وظيفة العامل الواحد: ياخد صورة ويبعتها ويرجع بالنص.
-    الـ index مهم عشان الترتيب ميبوظش لما نجمعهم.
-    """
     model_name = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     try:
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
     except:
-        return index, f"Error processing image {file_name}"
+        return index, f"[Error processing image data for {file_name}]"
 
     headers = {'Content-Type': 'application/json'}
     
@@ -95,27 +92,35 @@ def process_single_image_task(api_key, image_bytes, index, file_name):
         ]
     }
     
-    # محاولة مع إعادة المحاولة الذكية لكل عامل
-    max_retries = 4
+    # زيادة عدد المحاولات لـ 6 عشان منستسلمش بسهولة
+    max_retries = 6
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
+            
             if response.status_code == 200:
-                text = response.json()['candidates'][0]['content']['parts'][0]['text']
-                return index, text # بنرجع الرقم مع النص عشان الترتيب
+                return index, response.json()['candidates'][0]['content']['parts'][0]['text']
+            
             elif response.status_code == 429:
-                time.sleep(2 + attempt) # كل عامل يستنى شوية لو الدنيا زحمة
+                # لو السيرفر مشغول، ننام وقت أطول كل مرة (Exponential Backoff)
+                # معادلة: (رقم المحاولة * 3) + وقت عشوائي عشان العمال ميخبطوش في بعض
+                sleep_time = (attempt + 1) * 3 + random.uniform(0, 2)
+                time.sleep(sleep_time)
                 continue
+            
             elif response.status_code == 503:
-                time.sleep(1)
+                time.sleep(2)
                 continue
+                
             else:
-                return index, f"Error {response.status_code}"
+                return index, f"[API Error {response.status_code}: Please check output manually]"
+                
         except Exception as e:
-            time.sleep(1)
+            time.sleep(2)
             continue
 
-    return index, "Failed after retries."
+    # لو فشل بعد 6 محاولات (وده صعب جداً يحصل دلوقتي)
+    return index, f"[Failed to convert page: {file_name}. Server was too busy.]"
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -149,7 +154,7 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    with st.status("Initializing Parallel Workers...", expanded=True) as status:
+    with st.status("Initializing Stable Workers...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
         add_page_borders(doc)
@@ -157,8 +162,8 @@ if uploaded_files and st.button("Start Processing 🚀"):
         title = doc.add_paragraph(doc_name_input, style='Title')
         title.alignment = 1 
         
-        # 1. تجهيز قائمة المهام (Tasks)
-        tasks_data = [] # هنخزن هنا الصور عشان نبعتها للعمال
+        # 1. تجهيز المهام
+        tasks_data = [] 
         st.write("📂 Preparing files...")
         
         global_index = 0
@@ -186,34 +191,36 @@ if uploaded_files and st.button("Start Processing 🚀"):
                  global_index += 1
 
         total_tasks = len(tasks_data)
-        st.write(f"⚡ Launching 4 parallel workers for {total_tasks} pages...")
         
-        # 2. التشغيل المتوازي (Multithreading)
-        results = [None] * total_tasks # مصفوفة فاضية نحط فيها النتايج بالترتيب
+        # 2. التشغيل المتوازي (Workers = 2)
+        # 2 هو الرقم الذهبي: أسرع من 1 بمرتين، وأكثر استقراراً من 4 بكتير
+        st.write(f"⚡ Processing {total_tasks} pages with 2 stable workers...")
+        
+        results = [None] * total_tasks
         completed_count = 0
         progress_bar = st.progress(0)
         
-        # max_workers=4 (أفضل رقم للباقة المجانية عشان ميعملش Limit بسرعة)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            # إرسال المهام
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_to_index = {
                 executor.submit(process_single_image_task, api_key, task["bytes"], task["index"], task["name"]): task["index"]
                 for task in tasks_data
             }
             
-            # استقبال النتائج أول بأول
             for future in concurrent.futures.as_completed(future_to_index):
                 idx, text = future.result()
-                results[idx] = text # تخزين النتيجة في مكانها الصحيح
+                results[idx] = text
                 
                 completed_count += 1
                 progress_bar.progress(completed_count / total_tasks)
-                # تحديث الحالة كل شوية
-                if completed_count % 2 == 0:
-                     st.write(f"✅ Finished page {completed_count}/{total_tasks}")
+                
+                # لو النص رجع فيه Error، نظهر تحذير
+                if "[Failed" in text or "[Error" in text:
+                    st.warning(f"⚠️ Warning on page {idx+1}: {text}")
+                elif completed_count % 5 == 0:
+                     st.write(f"✅ Completed {completed_count}/{total_tasks}...")
 
-        # 3. كتابة النتائج في ملف الوورد (بالترتيب الصحيح)
-        st.write("📝 Writing to Word document...")
+        # 3. الكتابة
+        st.write("📝 Finalizing document...")
         for i, text in enumerate(results):
             task_info = tasks_data[i]
             
@@ -231,7 +238,7 @@ if uploaded_files and st.button("Start Processing 🚀"):
                 doc.add_page_break()
 
         status.update(label="All Done!", state="complete", expanded=False)
-        st.success(f"تم الانتهاء من {total_tasks} صفحة بسرعة!")
+        st.success(f"تم الانتهاء! تمت معالجة {total_tasks} صفحة.")
         
         bio = io.BytesIO()
         doc.save(bio)
