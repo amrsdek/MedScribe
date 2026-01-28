@@ -4,3 +4,4 @@ python-docx
 Pillow
 gspread
 oauth2client
+pdf2image
