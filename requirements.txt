@@ -2,6 +2,5 @@ streamlit
 google-generativeai
 python-docx
 Pillow
-pandas
-streamlit-gsheets
-openpyxl
+gspread
+google-auth
