@@ -13,6 +13,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import time
 from pdf2image import convert_from_bytes
+import concurrent.futures # مكتبة المعالجة المتوازية
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -25,9 +26,9 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🩺 Medical Study Assistant")
+st.title("🩺 Medical Study Assistant (Parallel Mode ⚡)")
 
-# --- دوال التنسيق (زي ما هي) ---
+# --- دوال التنسيق ---
 def add_page_borders(doc):
     sections = doc.sections
     for section in sections:
@@ -60,11 +61,20 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة التحليل (السريعة مع نظام الطوارئ) ---
-def call_gemini_fast(api_key, image_bytes, mime_type="image/jpeg"):
+# --- دالة العامل الواحد (Worker Function) ---
+def process_single_image_task(api_key, image_bytes, index, file_name):
+    """
+    وظيفة العامل الواحد: ياخد صورة ويبعتها ويرجع بالنص.
+    الـ index مهم عشان الترتيب ميبوظش لما نجمعهم.
+    """
     model_name = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    try:
+        b64_image = base64.b64encode(image_bytes).decode('utf-8')
+    except:
+        return index, f"Error processing image {file_name}"
+
     headers = {'Content-Type': 'application/json'}
     
     medical_prompt = """
@@ -76,7 +86,7 @@ def call_gemini_fast(api_key, image_bytes, mime_type="image/jpeg"):
     """
     
     payload = {
-        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_image}}]}],
+        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}]}],
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -85,34 +95,27 @@ def call_gemini_fast(api_key, image_bytes, mime_type="image/jpeg"):
         ]
     }
     
-    # المحاولة 5 مرات في حالة وجود خطأ
-    max_retries = 5
+    # محاولة مع إعادة المحاولة الذكية لكل عامل
+    max_retries = 4
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
-            
             if response.status_code == 200:
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
+                text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                return index, text # بنرجع الرقم مع النص عشان الترتيب
             elif response.status_code == 429:
-                # لو السيرفر قال "زحمة" (429)، ننتظر وقت متزايد
-                wait_time = (attempt + 1) * 8  # المرة الأولى 8 ثواني، التانية 16..
-                st.toast(f"⚠️ Server busy. Waiting {wait_time}s to retry...", icon="⏳")
-                time.sleep(wait_time)
-                continue # نعيد المحاولة
-            
-            elif response.status_code == 503:
-                time.sleep(3)
+                time.sleep(2 + attempt) # كل عامل يستنى شوية لو الدنيا زحمة
                 continue
-            
+            elif response.status_code == 503:
+                time.sleep(1)
+                continue
             else:
-                return f"Error {response.status_code}"
-                
+                return index, f"Error {response.status_code}"
         except Exception as e:
-            time.sleep(2)
+            time.sleep(1)
             continue
 
-    return "Server failed after multiple retries."
+    return index, "Failed after retries."
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -146,7 +149,7 @@ with col2:
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    with st.status("Processing...", expanded=True) as status:
+    with st.status("Initializing Parallel Workers...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
         add_page_borders(doc)
@@ -154,65 +157,81 @@ if uploaded_files and st.button("Start Processing 🚀"):
         title = doc.add_paragraph(doc_name_input, style='Title')
         title.alignment = 1 
         
-        full_text_preview = ""
-        progress_bar = st.progress(0)
-        
-        # تجميع كل الصور من كل الملفات لمعرفة العدد الكلي
-        all_processing_items = []
+        # 1. تجهيز قائمة المهام (Tasks)
+        tasks_data = [] # هنخزن هنا الصور عشان نبعتها للعمال
         st.write("📂 Preparing files...")
         
+        global_index = 0
         for file in uploaded_files:
             if file.type == "application/pdf":
                 try:
                     pdf_images = convert_from_bytes(file.read())
-                    for idx, img in enumerate(pdf_images):
-                        all_processing_items.append({"type": "pdf_page", "img": img, "name": file.name, "page": idx+1})
+                    for img in pdf_images:
+                        img_byte_arr = io.BytesIO()
+                        img.save(img_byte_arr, format='JPEG')
+                        tasks_data.append({
+                            "index": global_index,
+                            "bytes": img_byte_arr.getvalue(),
+                            "name": f"{file.name} (Page {global_index+1})"
+                        })
+                        global_index += 1
                 except Exception as e:
                     st.error(f"Error PDF: {e}")
             else:
-                 all_processing_items.append({"type": "image", "file": file, "name": file.name})
+                 tasks_data.append({
+                     "index": global_index,
+                     "bytes": file.getvalue(),
+                     "name": file.name
+                 })
+                 global_index += 1
 
-        total_items = len(all_processing_items)
+        total_tasks = len(tasks_data)
+        st.write(f"⚡ Launching 4 parallel workers for {total_tasks} pages...")
         
-        # بداية المعالجة صورة صورة (بالسرعة العادية)
-        for i, item in enumerate(all_processing_items):
-            status.update(label=f"Processing {i+1}/{total_items}...", state="running")
+        # 2. التشغيل المتوازي (Multithreading)
+        results = [None] * total_tasks # مصفوفة فاضية نحط فيها النتايج بالترتيب
+        completed_count = 0
+        progress_bar = st.progress(0)
+        
+        # max_workers=4 (أفضل رقم للباقة المجانية عشان ميعملش Limit بسرعة)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # إرسال المهام
+            future_to_index = {
+                executor.submit(process_single_image_task, api_key, task["bytes"], task["index"], task["name"]): task["index"]
+                for task in tasks_data
+            }
             
-            # تجهيز الصورة
-            if item["type"] == "pdf_page":
-                img_byte_arr = io.BytesIO()
-                item["img"].save(img_byte_arr, format='JPEG')
-                image_bytes = img_byte_arr.getvalue()
-                display_name = f"{item['name']} - Page {item['page']}"
-            else:
-                image_bytes = item["file"].getvalue()
-                display_name = item["name"]
+            # استقبال النتائج أول بأول
+            for future in concurrent.futures.as_completed(future_to_index):
+                idx, text = future.result()
+                results[idx] = text # تخزين النتيجة في مكانها الصحيح
+                
+                completed_count += 1
+                progress_bar.progress(completed_count / total_tasks)
+                # تحديث الحالة كل شوية
+                if completed_count % 2 == 0:
+                     st.write(f"✅ Finished page {completed_count}/{total_tasks}")
+
+        # 3. كتابة النتائج في ملف الوورد (بالترتيب الصحيح)
+        st.write("📝 Writing to Word document...")
+        for i, text in enumerate(results):
+            task_info = tasks_data[i]
             
-            # الإرسال لجيميناي
-            text = call_gemini_fast(api_key, image_bytes)
-            
-            # الكتابة في الوورد
             if not hide_img_name:
-                doc.add_heading(display_name, level=1)
+                doc.add_heading(task_info["name"], level=1)
             
-            for line in text.split('\n'):
-                line = line.strip()
-                if not line: continue
-                if line.startswith('#'):
-                    doc.add_heading(line.replace('#', '').strip(), level=1)
-                else:
-                    doc.add_paragraph(line)
-            
-            doc.add_page_break()
-            full_text_preview += f"\n{text}\n"
-            progress_bar.progress((i + 1) / total_items)
-            
-            # راحة قصيرة جداً (ثانية ونص) للحفاظ على استقرار الباقة
-            # دي مش هتبطأك أوي بس هتحميك من الـ Error 429
-            time.sleep(1.5)
+            if text:
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    if line.startswith('#'):
+                        doc.add_heading(line.replace('#', '').strip(), level=1)
+                    else:
+                        doc.add_paragraph(line)
+                doc.add_page_break()
 
         status.update(label="All Done!", state="complete", expanded=False)
-        st.success("تم الانتهاء!")
+        st.success(f"تم الانتهاء من {total_tasks} صفحة بسرعة!")
         
         bio = io.BytesIO()
         doc.save(bio)
