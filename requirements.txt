@@ -4,3 +4,4 @@ python-docx
 Pillow
 pandas
 streamlit-gsheets
+openpyxl
