@@ -1,6 +1,6 @@
 streamlit
-google-generativeai
+requests
 python-docx
 Pillow
 gspread
-google-auth
+oauth2client
