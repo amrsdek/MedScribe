@@ -10,6 +10,7 @@ import io
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+import time  # مكتبة الوقت عشان ندي السيرفر مهلة
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="Medical Study Assistant", page_icon="🩺", layout="centered")
@@ -25,54 +26,47 @@ st.markdown("""
 st.title("🩺 Medical Study Assistant")
 st.write("حول صور المحاضرات والكتب إلى ملف Word منسق.")
 
-# --- دالة ضبط تنسيق ملف الوورد (الجزء الجديد) ---
+# --- دالة التنسيق ---
 def setup_word_styles(doc):
-    # 1. ضبط الخط الأساسي للنص العادي (Normal)
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Times New Roman'
     font.size = Pt(12)
     font.bold = False
-    # إجبار الوورد على استخدام Times New Roman للعربي والإنجليزي
     rPr = style.element.get_or_add_rPr()
     rPr.rFonts.set(qn('w:ascii'), 'Times New Roman')
     rPr.rFonts.set(qn('w:hAnsi'), 'Times New Roman')
     rPr.rFonts.set(qn('w:eastAsia'), 'Times New Roman')
     rPr.rFonts.set(qn('w:cs'), 'Times New Roman')
 
-    # 2. ضبط العناوين الرئيسية (Heading 1) لتكون 14 و Bold
     h1_style = doc.styles['Heading 1']
     h1_font = h1_style.font
     h1_font.name = 'Times New Roman'
     h1_font.size = Pt(14)
     h1_font.bold = True
-    h1_font.color.rgb = None # جعل اللون أسود تلقائي (بدل الأزرق الافتراضي)
+    h1_font.color.rgb = None
     
-    # 3. ضبط عنوان المستند (Title)
     title_style = doc.styles['Title']
     title_font = title_style.font
     title_font.name = 'Times New Roman'
-    title_font.size = Pt(16) # ممكن نخليه أكبر سنة للعنوان الرئيسي
+    title_font.size = Pt(16)
     title_font.bold = True
     title_font.color.rgb = None
 
-# --- دالة التحليل الطبي ---
-def call_gemini_medical(api_key, image_bytes, mime_type):
+# --- دالة التحليل الطبي (مع نظام إعادة المحاولة) ---
+def call_gemini_medical_with_retry(api_key, image_bytes, mime_type):
     model_name = "gemini-2.5-flash"
     if mime_type == 'image/jpg': mime_type = 'image/jpeg'
-        
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     b64_image = base64.b64encode(image_bytes).decode('utf-8')
     headers = {'Content-Type': 'application/json'}
     
-    # نطلب من الموديل يرجع نص صافي عشان التنسيق يظبط معانا
     medical_prompt = """
     You are an expert Medical Scribe. 
     Analyze this medical image. Extract all text accurately.
     - Do NOT use Markdown formatting (like ## or **). 
     - Just provide clean, plain text with natural paragraphs.
-    - Maintain the logical structure of the content.
     """
     
     safety_settings = [
@@ -83,30 +77,38 @@ def call_gemini_medical(api_key, image_bytes, mime_type):
     ]
     
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": medical_prompt},
-                {"inline_data": {"mime_type": mime_type, "data": b64_image}}
-            ]
-        }],
+        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_image}}]}],
         "safetySettings": safety_settings
     }
     
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        else:
-            return f"Error {response.status_code}"
-    except Exception as e:
-        return f"Error: {str(e)}"
+    # --- بداية نظام الـ Retry (الإصرار) ---
+    max_retries = 3  # هنجرب 3 مرات كحد أقصى
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            
+            if response.status_code == 200:
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            
+            elif response.status_code == 503:
+                # لو السيرفر مشغول، انتظر وجرب تاني
+                time.sleep(2) # استنى ثانيتين
+                continue # عيد المحاولة
+                
+            else:
+                return f"Error {response.status_code}"
+                
+        except Exception as e:
+            time.sleep(1)
+            continue
+
+    return "Server is busy, please try again later."
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        if "gcp_service_account" not in st.secrets:
-            return "Missing Credentials"
+        if "gcp_service_account" not in st.secrets: return "Missing Credentials"
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
@@ -114,55 +116,48 @@ def send_feedback_to_sheet(feedback_text):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([timestamp, feedback_text])
         return True
-    except Exception as e:
-        return str(e)
+    except Exception as e: return str(e)
 
-# --- الواجهة الرئيسية ---
-
+# --- الواجهة ---
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
     st.error("API Key missing.")
     st.stop()
 
-# 1. إدخال اسم الملف (عنوان المستند)
 doc_name_input = st.text_input("اسم الملف (عنوان المذاكرة):", value="Medical Notes")
-
 uploaded_files = st.file_uploader("Upload Images", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    with st.status("Processing...", expanded=True):
+    with st.status("Processing...", expanded=True) as status:
         doc = Document()
-        # استدعاء دالة التنسيق لتطبيق الخطوط
         setup_word_styles(doc)
-        
-        # استخدام الاسم المدخل كعنوان رئيسي للملف
         doc.add_heading(doc_name_input, 0)
         
         full_text_preview = ""
         progress_bar = st.progress(0)
         
         for i, file in enumerate(uploaded_files):
-            st.write(f"Processing: {file.name}")
-            text = call_gemini_medical(api_key, file.getvalue(), file.type)
+            st.write(f"Analyzing Image {i+1} ({file.name})...")
             
-            # إضافة اسم الصورة كعنوان فرعي (يأخذ تنسيق Heading 1 - 14 Bold)
+            # استدعاء الدالة الجديدة
+            text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
+            
             doc.add_heading(f'Page: {i+1} ({file.name})', level=1)
-            
-            # إضافة النص المستخرج (يأخذ تنسيق Normal - 12 Regular)
             doc.add_paragraph(text)
-            
-            # فاصل صفحات
             doc.add_page_break()
             
             full_text_preview += f"--- {file.name} ---\n{text}\n\n"
             progress_bar.progress((i + 1) / len(uploaded_files))
+            
+            # مهلة صغيرة جداً بين كل صورة والتانية عشان منزعلش السيرفر
+            time.sleep(1)
         
-        st.success("Done!")
+        status.update(label="All Done!", state="complete", expanded=False)
+        st.success("تم الانتهاء بنجاح!")
+        
         bio = io.BytesIO()
         doc.save(bio)
-        
-        # تجهيز اسم الملف للتحميل (.docx)
         final_filename = f"{doc_name_input}.docx"
         
         st.download_button(
@@ -172,12 +167,3 @@ if uploaded_files and st.button("Start Processing 🚀"):
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             type="primary"
         )
-        
-        with st.expander("Preview Text"):
-            st.text(full_text_preview)
-
-st.markdown("---")
-with st.form("feedback"):
-    fb = st.text_area("Feedback:")
-    if st.form_submit_button("Send"):
-        send_feedback_to_sheet(fb)
