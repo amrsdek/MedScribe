@@ -25,8 +25,8 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🩺 Medical Study Assistant")
-st.write("حول صور المحاضرات أو ملفات PDF (Scanned) إلى ملف Word منسق.")
+st.title("🩺 Medical Study Assistant (Turbo Mode 🚀)")
+st.write("حول صور المحاضرات والكتب بسرعة عالية باستخدام تقنية Batching.")
 
 # --- دوال التنسيق ---
 def add_page_borders(doc):
@@ -61,61 +61,67 @@ def setup_word_styles(doc):
     h1_font.bold = True
     h1_font.color.rgb = None
 
-# --- دالة التحليل (المعدلة للتعامل مع الضغط 429) ---
-def call_gemini_medical_with_retry(api_key, image_bytes, mime_type="image/jpeg"):
+# --- دالة التحليل (بنظام الدفعات Batching) ---
+def call_gemini_batch(api_key, images_list, start_index):
+    """
+    ترسل مجموعة صور مرة واحدة لجيميناي لتقليل عدد الطلبات وتسريع العملية.
+    """
     model_name = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    b64_image = base64.b64encode(image_bytes).decode('utf-8')
     headers = {'Content-Type': 'application/json'}
     
-    medical_prompt = """
-    You are an expert Medical Scribe. Analyze this medical image.
-    1. Extract all text accurately.
-    2. **Headings:** If you see a clear TITLE or HEADING in the image, start that line with a hash symbol (#). Example: "# Anatomy of Heart".
-    3. **Body Text:** Write normal text as is.
-    4. Do NOT use any other markdown.
+    # 1. تجهيز الرسالة (Prompt)
+    prompt_text = """
+    You are an expert Medical Scribe. I am sending you a batch of medical notes pages.
+    Process them ONE BY ONE in order.
+    
+    For EACH page image, follow these rules:
+    1. Start with a separator line: "--- PAGE [Number] ---"
+    2. Extract all text accurately.
+    3. **Headings:** If you see a clear TITLE or HEADING, start the line with # (e.g., # Diagnosis).
+    4. **Body Text:** Plain text.
+    5. Do NOT summarize. Transcribe full content.
     """
     
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-    ]
+    # 2. تجميع الصور في الرسالة
+    parts = [{"text": prompt_text}]
+    
+    for img_bytes in images_list:
+        b64_image = base64.b64encode(img_bytes).decode('utf-8')
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": b64_image
+            }
+        })
     
     payload = {
-        "contents": [{"parts": [{"text": medical_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_image}}]}],
-        "safetySettings": safety_settings
+        "contents": [{"parts": parts}],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
     }
     
-    # محاولة حتى 5 مرات (بدل 3)
-    max_retries = 5
+    # 3. الإرسال مع إعادة المحاولة الذكية
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
-            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
             elif response.status_code == 429:
-                # لو الخطأ 429 (Too Many Requests)
-                wait_time = (attempt + 1) * 10  # استنى 10 ثواني، ثم 20، ثم 30...
-                st.warning(f"⚠️ ضغط عالي على السيرفر.. جاري الانتظار {wait_time} ثواني (محاولة {attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+                time.sleep(5) # انتظار بسيط عند الزحمة
                 continue
-            
-            elif response.status_code == 503:
-                # لو الخطأ 503 (Service Unavailable)
-                time.sleep(5)
-                continue
-                
             else:
                 return f"Error {response.status_code}"
-        except Exception as e:
+        except:
             time.sleep(2)
             continue
-
-    return "Server is too busy. Try converting fewer pages at a time."
+            
+    return "Failed to process batch."
 
 # --- دالة الفيدباك ---
 def send_feedback_to_sheet(feedback_text):
@@ -144,12 +150,12 @@ with col1:
 with col2:
     st.write("") 
     st.write("") 
-    hide_img_name = st.checkbox("إخفاء اسم الصورة؟", value=False)
+    hide_img_name = st.checkbox("إخفاء فواصل الصفحات؟", value=False)
 
 uploaded_files = st.file_uploader("Upload PDF or Images", type=["pdf", "jpg", "png", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Start Processing 🚀"):
-    with st.status("Processing...", expanded=True) as status:
+    with st.status("Processing in Turbo Mode...", expanded=True) as status:
         doc = Document()
         setup_word_styles(doc)
         add_page_borders(doc)
@@ -157,75 +163,71 @@ if uploaded_files and st.button("Start Processing 🚀"):
         title = doc.add_paragraph(doc_name_input, style='Title')
         title.alignment = 1 
         
-        full_text_preview = ""
-        progress_bar = st.progress(0)
+        # 1. تجميع كل الصور من كل الملفات في قائمة واحدة الأول
+        all_images_bytes = []
+        original_filenames = [] # عشان نعرف المصدر لو احتاجنا
         
-        total_files_count = len(uploaded_files)
-        current_file_index = 0
-
+        progress_bar = st.progress(0)
+        st.write("📂 Preparing files...")
+        
         for file in uploaded_files:
-            current_file_index += 1
-            
             if file.type == "application/pdf":
-                st.write(f"📄 Extracting PDF: {file.name}...")
                 try:
-                    images = convert_from_bytes(file.read())
-                    # لو PDF كبير، ناخد راحة أطول بين الصفحات
-                    pdf_delay = 4 
-                    
-                    for page_num, img in enumerate(images):
-                        st.write(f"Analyzing Page {page_num + 1}...")
-                        
+                    pdf_images = convert_from_bytes(file.read())
+                    for img in pdf_images:
                         img_byte_arr = io.BytesIO()
                         img.save(img_byte_arr, format='JPEG')
-                        img_bytes = img_byte_arr.getvalue()
-                        
-                        text = call_gemini_medical_with_retry(api_key, img_bytes, "image/jpeg")
-                        
-                        if not hide_img_name:
-                            doc.add_heading(f'{file.name} - Page {page_num+1}', level=1)
-                        
-                        for line in text.split('\n'):
-                            line = line.strip()
-                            if not line: continue
-                            if line.startswith('#'):
-                                clean_line = line.replace('#', '').strip()
-                                doc.add_heading(clean_line, level=1)
-                            else:
-                                doc.add_paragraph(line)
-                        
-                        doc.add_page_break()
-                        full_text_preview += f"\n{text}\n"
-                        # استراحة إجبارية بين كل صفحة والتانية
-                        time.sleep(pdf_delay)
-
+                        all_images_bytes.append(img_byte_arr.getvalue())
+                        original_filenames.append(file.name)
                 except Exception as e:
-                    st.error(f"Error reading PDF: {e}")
-            
+                    st.error(f"Error in PDF: {e}")
             else:
-                st.write(f"🖼️ Analyzing: {file.name}...")
-                text = call_gemini_medical_with_retry(api_key, file.getvalue(), file.type)
-                
-                if not hide_img_name:
-                    doc.add_heading(f'Image: {file.name}', level=1)
-                
-                for line in text.split('\n'):
-                    line = line.strip()
-                    if not line: continue
-                    if line.startswith('#'):
-                        clean_line = line.replace('#', '').strip()
-                        doc.add_heading(clean_line, level=1)
-                    else:
-                        doc.add_paragraph(line)
-                
-                doc.add_page_break()
-                full_text_preview += f"\n{text}\n"
-                time.sleep(3) # استراحة 3 ثواني للصور العادية
+                all_images_bytes.append(file.getvalue())
+                original_filenames.append(file.name)
 
-            progress_bar.progress(current_file_index / total_files_count)
+        # 2. تقسيم الصور لمجموعات (Batches) - كل مجموعة 5 صور
+        batch_size = 5
+        total_batches = (len(all_images_bytes) + batch_size - 1) // batch_size
         
-        status.update(label="All Done!", state="complete", expanded=False)
-        st.success("تم الانتهاء!")
+        full_text_preview = ""
+        
+        for i in range(0, len(all_images_bytes), batch_size):
+            batch_images = all_images_bytes[i : i + batch_size]
+            current_batch_num = (i // batch_size) + 1
+            
+            st.write(f"⚡ Processing Batch {current_batch_num}/{total_batches} (Pages {i+1}-{i+len(batch_images)})...")
+            
+            # إرسال الدفعة لجيميناي
+            batch_text = call_gemini_batch(api_key, batch_images, i+1)
+            
+            # معالجة النص القادم
+            lines = batch_text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                
+                # التعامل مع الفواصل اللي جيميناي بيحطها
+                if "--- PAGE" in line:
+                    if not hide_img_name:
+                         # استخراج رقم الصفحة أو كتابة فاصل
+                         doc.add_heading(line.replace('---', '').strip(), level=1)
+                    else:
+                        doc.add_page_break() # لو مخفي، بس افصل بصفحة جديدة
+                elif line.startswith('#'):
+                    clean_line = line.replace('#', '').strip()
+                    doc.add_heading(clean_line, level=1)
+                else:
+                    doc.add_paragraph(line)
+            
+            full_text_preview += f"\n{batch_text}\n"
+            progress_bar.progress(current_batch_num / total_batches)
+            
+            # راحة صغيرة جداً (ثانيتين) بين كل دفعة (5 صور) مش كل صورة
+            if current_batch_num < total_batches:
+                time.sleep(2) 
+        
+        status.update(label="Done!", state="complete", expanded=False)
+        st.success(f"تم تحويل {len(all_images_bytes)} صفحة بنجاح!")
         
         bio = io.BytesIO()
         doc.save(bio)
@@ -238,6 +240,9 @@ if uploaded_files and st.button("Start Processing 🚀"):
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             type="primary"
         )
+        
+        with st.expander("Preview Content"):
+            st.text(full_text_preview)
 
 st.markdown("---")
 with st.form("feedback"):
